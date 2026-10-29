@@ -1,39 +1,52 @@
-# This workflow will install Python dependencies, run tests and lint with a single version of Python
-# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-python
-
-name: Python application
+name: Build TrajCompare.exe
 
 on:
   push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
-
-permissions:
-  contents: read
+    branches: ["main", "master"]
+  workflow_dispatch:
 
 jobs:
   build:
-
-    runs-on: ubuntu-latest
-
+    runs-on: windows-latest
     steps:
-    - uses: actions/checkout@v4
-    - name: Set up Python 3.10
-      uses: actions/setup-python@v3
-      with:
-        python-version: "3.10"
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install flake8 pytest
-        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-    - name: Lint with flake8
-      run: |
-        # stop the build if there are Python syntax errors or undefined names
-        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
-        # exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
-        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
-    - name: Test with pytest
-      run: |
-        pytest
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Check project files
+        shell: pwsh
+        run: |
+          foreach ($f in 'trajcompare.py','trajcompare_gui.py','requirements.txt') {
+            if (-not (Test-Path $f)) {
+              Write-Error "Нет файла $f в корне репозитория. Загрузите файлы из архива TrajCompare_build.zip в корень (не во вложенную папку)."
+              exit 1
+            }
+          }
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build exe
+        run: >
+          pyinstaller --noconfirm --clean --onefile --windowed --name TrajCompare
+          --hidden-import mpl_toolkits.mplot3d
+          --exclude-module scipy --exclude-module IPython --exclude-module PyQt5 --exclude-module PySide6
+          trajcompare_gui.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TrajCompare-windows
+          path: dist/TrajCompare.exe
+
+      - name: Smoke test on samples
+        shell: pwsh
+        run: |
+          if (Test-Path samples) {
+            $p = Start-Process -Wait -PassThru -FilePath dist\TrajCompare.exe -ArgumentList 'pair','samples\Точное.xlsx','samples\Альтернативное.xlsx','-o','smoke'
+            if (-not (Get-ChildItem smoke -Filter *.xlsx -ErrorAction SilentlyContinue)) { Write-Error "Собранный exe не создал отчёт"; exit 1 }
+            Write-Host "Smoke test OK"
+          } else { Write-Host "Папки samples нет, проверку пропускаю" }
