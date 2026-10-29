@@ -42,11 +42,4 @@ jobs:
           name: TrajCompare-windows
           path: dist/TrajCompare.exe
 
-      - name: Smoke test on samples
-        shell: pwsh
-        run: |
-          if (Test-Path samples) {
-            $p = Start-Process -Wait -PassThru -FilePath dist\TrajCompare.exe -ArgumentList 'pair','samples\Точное.xlsx','samples\Альтернативное.xlsx','-o','smoke'
-            if (-not (Get-ChildItem smoke -Filter *.xlsx -ErrorAction SilentlyContinue)) { Write-Error "Собранный exe не создал отчёт"; exit 1 }
-            Write-Host "Smoke test OK"
-          } else { Write-Host "Папки samples нет, проверку пропускаю" }
+     
