@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-trajcompare — автоматическое сравнение альтернативных траекторий скважин.
+trajcompare — автоматическое сравнение траекторий скважин РН-ПД и РНТ.
 
 Режимы:
-  pair   — сравнить одну пару файлов (эталон / альтернатива)
+  pair   — сравнить одну пару файлов (РН-ПД / РНТ)
   batch  — пакетная обработка сотен/тысяч пар (параллельно, с журналом ошибок)
 
 Примеры:
-  python trajcompare.py pair Точное.xlsx Альтернативное.xlsx -o out
+  python trajcompare.py pair РН-ПД.xlsx РНТ.xlsx -o out
   python trajcompare.py batch --root wells/ -o out --workers 8
   python trajcompare.py batch --ref-dir ref/ --alt-dir alt/ -o out
   python trajcompare.py batch --manifest pairs.csv -o out
@@ -53,6 +53,8 @@ DEFAULTS = dict(
     plots=True,
     excel=True,
     dpi=130,
+    dpi_embed=80,           # разрешение графиков, вставляемых в общую книгу
+    profile_step=25.0,      # шаг таблицы расхождения на листе скважины, м
 )
 
 # Синонимы заголовков (нормализованные, нижний регистр). Порядок = приоритет.
@@ -67,6 +69,7 @@ COLS = {
     "north":    ["x north", "north", "север", "x (m)"],
     "east":     ["y east", "east", "восток", "y (m)"],
     "comment":  ["коммент", "comment", "пласт", "target", "цель", "маркер"],
+    "well":     ["скважина", "скв", "well", "wellname", "well name"],
 }
 EXCLUDE = {  # чтобы "азимут" не схватил магнитный, а "север" — "Север/Восток" локальные
     "azi": ["магнит", "magn", "на точку"],
@@ -110,11 +113,11 @@ def _pick(headers: list[str], data: pd.DataFrame, key: str):
                 break
     if not cands:
         return None
-    if key == "comment":
+    if key in ("comment", "well"):
         return min(cands)[1]
     scored = []
     for pri, j in cands:
-        v = pd.to_numeric(data.iloc[:, j], errors="coerce")
+        v = _to_num(data.iloc[:, j])
         scored.append((-v.notna().sum(), -float(np.nanmax(np.abs(v))) if v.notna().any() else 0, pri, j))
     return min(scored)[3]
 
@@ -154,11 +157,41 @@ def min_curvature(md, inc, azi, n0=0.0, e0=0.0, z0=0.0):
             z0 + np.r_[0, np.cumsum(dz)], np.degrees(b))
 
 
-def read_trajectory(path: str | Path, name: str = "") -> Trajectory:
+def _to_num(s: pd.Series) -> pd.Series:
+    """Число из ячейки: понимает и точку, и запятую как десятичный разделитель, пробелы в тысячах."""
+    if s.dtype == object:
+        s = s.astype(str).str.replace("\u00a0", "", regex=False).str.replace(" ", "", regex=False) \
+             .str.replace(",", ".", regex=False)
+    return pd.to_numeric(s, errors="coerce")
+
+
+def read_csv_raw(path: str | Path) -> pd.DataFrame:
+    """CSV с разделителем-запятой (по умолчанию); кодировка UTF-8 или Windows-1251."""
+    last = None
+    for enc in ("utf-8-sig", "cp1251"):
+        try:
+            return pd.read_csv(path, sep=None if CSV_SEP == "auto" else CSV_SEP, header=None, dtype=str,
+                               encoding=enc, engine="python", skip_blank_lines=False)
+        except UnicodeDecodeError as ex:
+            last = ex
+    raise ValueError(f"не удалось прочитать CSV {path}: {last}")
+
+
+CSV_SEP = ","
+
+
+def read_trajectory(path: str | Path, name: str = "", sheet: str | None = None) -> Trajectory:
     path = Path(path)
+    if path.suffix.lower() in (".csv", ".txt"):
+        return parse_raw(read_csv_raw(path), name or path.stem, str(path), path.stem)
     xl = pd.ExcelFile(path)
-    sheet = xl.sheet_names[0]
+    sheet = sheet if sheet is not None else xl.sheet_names[0]
     raw = pd.read_excel(xl, sheet_name=sheet, header=None)
+    well = sheet if sheet.lower() not in ("sheet1", "лист1") else path.stem
+    return parse_raw(raw, name or path.stem, str(path), well)
+
+
+def parse_raw(raw: pd.DataFrame, name: str, path: str, well: str) -> Trajectory:
     hr = _find_header_row(raw)
     headers = [_norm(c) for c in raw.iloc[hr].tolist()]
     data = raw.iloc[hr + 1:].reset_index(drop=True)
@@ -173,7 +206,7 @@ def read_trajectory(path: str | Path, name: str = "") -> Trajectory:
     if cols["md"] is None or cols["inc"] is None or cols["azi"] is None:
         raise ValueError(f"нет обязательных колонок MD/зенит/азимут: {cols}")
 
-    num = lambda k: pd.to_numeric(data.iloc[:, cols[k]], errors="coerce") if cols.get(k) is not None else None
+    num = lambda k: _to_num(data.iloc[:, cols[k]]) if cols.get(k) is not None else None
     md = num("md")
     ok = md.notna()
     df = pd.DataFrame({"md": md, "inc": num("inc"), "azi": num("azi")})
@@ -210,8 +243,7 @@ def read_trajectory(path: str | Path, name: str = "") -> Trajectory:
         if c and c.lower() != "nan":
             marks.append((float(m), c))
 
-    well = sheet if sheet.lower() not in ("sheet1", "лист1") else path.stem
-    return Trajectory(name or path.stem, str(path), str(well), md_, inc_, azi_,
+    return Trajectory(name, str(path), str(well), md_, inc_, azi_,
                       n_, e_, z_, tvd_, marks, azi_src,
                       {k: (raw.iloc[hr, v] if v is not None else None) for k, v in cols.items()})
 
@@ -306,7 +338,7 @@ def compare(ref: Trajectory, alt: Trajectory, cfg=DEFAULTS, well: str | None = N
     gr, Pr = resample(ref, step)
     ga, Pa = resample(alt, step)
 
-    # Расхождение: ближайшее расстояние (эталон → альтернатива и обратно)
+    # Расхождение: ближайшее расстояние (РН-ПД → РНТ и обратно)
     d_ra, md_on_a, pt_a = nearest_on_polyline(Pr, alt.xyz, alt.md)
     d_ar, _, _ = nearest_on_polyline(Pa, ref.xyz, ref.md)
     dv = pt_a[:, 2] - Pr[:, 2]
@@ -319,15 +351,15 @@ def compare(ref: Trajectory, alt: Trajectory, cfg=DEFAULTS, well: str | None = N
     same[:len(common)] = np.linalg.norm(Pa_same - Pr[:len(common)], axis=1)
 
     profile = pd.DataFrame({
-        "MD эталон, м": gr, "TVDSS эталон, м": Pr[:, 2],
-        "MD альтернатива (ближ. точка), м": md_on_a,
-        "Расхождение 3D, м": d_ra, "по горизонтали, м": dh, "по вертикали (alt−ref), м": dv,
-        "ΔMD (alt−ref), м": md_on_a - gr, "Расхождение при равной MD, м": same,
+        "MD РН-ПД, м": gr, "TVDSS РН-ПД, м": Pr[:, 2],
+        "MD РНТ (ближ. точка), м": md_on_a,
+        "Расхождение 3D, м": d_ra, "по горизонтали, м": dh, "по вертикали (РНТ−РН-ПД), м": dv,
+        "ΔMD (РНТ−РН-ПД), м": md_on_a - gr, "Расхождение при равной MD, м": same,
     })
 
     # Реперные точки / цели: из комментариев обоих файлов + устье и забой
     rx = re.compile(cfg["target_regex"])
-    pts = [("Устье", ref.md[0], ref, False), ("Забой эталона", ref.md[-1], ref, False)]
+    pts = [("Устье", ref.md[0], ref, False), ("Забой РН-ПД", ref.md[-1], ref, False)]
     for t in (ref, alt):
         for m, c in t.marks:
             pts.append((c, m, t, bool(rx.search(c))))
@@ -351,7 +383,7 @@ def compare(ref: Trajectory, alt: Trajectory, cfg=DEFAULTS, well: str | None = N
 
     pr, pa = traj_params(ref, cfg), traj_params(alt, cfg)
     summary = pd.DataFrame({"Параметр": list(pr), ref.name: list(pr.values()), alt.name: list(pa.values())})
-    summary["Разница (alt−ref)"] = [
+    summary["Разница (РНТ−РН-ПД)"] = [
         (b - a) if isinstance(a, (int, float, np.floating)) and isinstance(b, (int, float, np.floating)) else ""
         for a, b in zip(pr.values(), pa.values())]
 
@@ -377,7 +409,7 @@ def compare(ref: Trajectory, alt: Trajectory, cfg=DEFAULTS, well: str | None = N
         verdict = "Не сходятся"
 
     row = {
-        "Скважина": well, "Эталон": Path(ref.path).name, "Альтернатива": Path(alt.path).name,
+        "Скважина": well, "РН-ПД": Path(ref.path).name, "РНТ": Path(alt.path).name,
         "Вердикт": verdict, "Причины": "; ".join(reasons),
         "Расхождение устьев, м": wh, "Макс. промах по целям, м": tmiss,
         "Число целей": len(tg),
@@ -387,11 +419,11 @@ def compare(ref: Trajectory, alt: Trajectory, cfg=DEFAULTS, well: str | None = N
         "P95 расхождения, м": float(np.percentile(d_ra, 95)),
         "RMS расхождения, м": float(np.sqrt((d_ra ** 2).mean())),
         f"Доля ствола в пределах {cfg['sep_tol']:.0f} м, %": within,
-        "Длина эталона, м": pr["Длина по стволу, м"], "Длина альтернативы, м": pa["Длина по стволу, м"],
-        "ΔДлины (alt−ref), м": pa["Длина по стволу, м"] - pr["Длина по стволу, м"],
-        "Макс. DLS эталон, °/10м": pr["Макс. интенсивность, град/10 м"],
+        "Длина РН-ПД, м": pr["Длина по стволу, м"], "Длина РНТ, м": pa["Длина по стволу, м"],
+        "ΔДлины (РНТ−РН-ПД), м": pa["Длина по стволу, м"] - pr["Длина по стволу, м"],
+        "Макс. DLS РН-ПД, °/10м": pr["Макс. интенсивность, град/10 м"],
         "Макс. DLS альт., °/10м": pa["Макс. интенсивность, град/10 м"],
-        "QC поправка азимута эталон, °": pr["QC: поправка азимута, совмещающая с координатами, град"],
+        "QC поправка азимута РН-ПД, °": pr["QC: поправка азимута, совмещающая с координатами, град"],
         "QC поправка азимута альт., °": pa["QC: поправка азимута, совмещающая с координатами, град"],
     }
     return PairResult(well, ref, alt, summary, targets, profile, row)
@@ -403,10 +435,10 @@ def compare(ref: Trajectory, alt: Trajectory, cfg=DEFAULTS, well: str | None = N
 C_REF, C_ALT, C_SEP = "#1f5aa6", "#d9534f", "#6b6b6b"
 
 
-def plot_pair(res: PairResult, out_png: Path, cfg=DEFAULTS):
+def plot_pair(res: PairResult, out_png, cfg=DEFAULTS, dpi=None):
     r, a = res.ref, res.alt
     n0, e0 = r.n[0], r.e[0]
-    # Плоскость вертикального разреза — азимут на забой эталона
+    # Плоскость вертикального разреза — азимут на забой РН-ПД
     az = math.atan2(r.e[-1] - e0, r.n[-1] - n0)
     sec = lambda t: (t.n - n0) * math.cos(az) + (t.e - e0) * math.sin(az)
     tg = res.targets[res.targets["Цель"] == "да"]
@@ -470,10 +502,10 @@ def plot_pair(res: PairResult, out_png: Path, cfg=DEFAULTS):
     # 6. Расхождение по стволу
     ax = fig.add_subplot(gs[1, 1:3])
     p = res.profile
-    ax.fill_between(p["MD эталон, м"], 0, p["Расхождение 3D, м"], color=C_SEP, alpha=.25)
-    ax.plot(p["MD эталон, м"], p["Расхождение 3D, м"], color="k", lw=1.8, label="3D (ближайшее)")
-    ax.plot(p["MD эталон, м"], p["по горизонтали, м"], color="#5cb85c", lw=1.2, label="по горизонтали")
-    ax.plot(p["MD эталон, м"], p["по вертикали (alt−ref), м"], color="#9b59b6", lw=1.2, label="по вертикали (alt−ref)")
+    ax.fill_between(p["MD РН-ПД, м"], 0, p["Расхождение 3D, м"], color=C_SEP, alpha=.25)
+    ax.plot(p["MD РН-ПД, м"], p["Расхождение 3D, м"], color="k", lw=1.8, label="3D (ближайшее)")
+    ax.plot(p["MD РН-ПД, м"], p["по горизонтали, м"], color="#5cb85c", lw=1.2, label="по горизонтали")
+    ax.plot(p["MD РН-ПД, м"], p["по вертикали (РНТ−РН-ПД), м"], color="#9b59b6", lw=1.2, label="по вертикали (РНТ−РН-ПД)")
     ax.axhline(cfg["sep_tol"], color="#d9534f", ls=":", lw=1.2, label=f"допуск {cfg['sep_tol']:.0f} м")
     ax.axhline(0, color="k", lw=.5)
     for _, q in tg.iterrows():
@@ -483,7 +515,7 @@ def plot_pair(res: PairResult, out_png: Path, cfg=DEFAULTS):
             ax.text(q["MD в источнике, м"], ax.get_ylim()[1] * .95, lbl.group(0) if lbl else str(q["Точка"]),
                     fontsize=9, rotation=90, va="top", ha="right")
     ax.legend(fontsize=8, ncol=4, loc="upper left")
-    style(ax, "Расхождение стволов по глубине эталона", "MD эталона, м", "м")
+    style(ax, "Расхождение стволов по глубине РН-ПД", "MD РН-ПД, м", "м")
 
     # 7. Зенит и интенсивность
     ax = fig.add_subplot(gs[1, 3])
@@ -497,7 +529,7 @@ def plot_pair(res: PairResult, out_png: Path, cfg=DEFAULTS):
     ax.legend(fontsize=8, loc="lower right")
     style(ax, "Зенит и интенсивность по стволу", "MD, м", "Зенит, град")
 
-    fig.savefig(out_png, dpi=cfg["dpi"], bbox_inches="tight")
+    fig.savefig(out_png, dpi=dpi or cfg["dpi"], bbox_inches="tight", format="png")
     plt.close(fig)
 
 
@@ -610,7 +642,7 @@ def _safe(s: str) -> str:
     return re.sub(r'[\\/:*?"<>|\s]+', "_", str(s)).strip("_") or "well"
 
 
-def run_pair(ref_path, alt_path, out_dir, cfg=DEFAULTS, well=None, ref_name="Точное", alt_name="Альтернативное"):
+def run_pair(ref_path, alt_path, out_dir, cfg=DEFAULTS, well=None, ref_name="РН-ПД", alt_name="РНТ"):
     out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
     ref = read_trajectory(ref_path, ref_name)
     alt = read_trajectory(alt_path, alt_name)
@@ -632,7 +664,7 @@ def _worker(job):
         row = res.row; row["Время, с"] = round(time.time() - t0, 2)
         return True, row
     except Exception as ex:  # noqa: BLE001
-        return False, {"Скважина": well, "Эталон": str(ref_p), "Альтернатива": str(alt_p),
+        return False, {"Скважина": well, "РН-ПД": str(ref_p), "РНТ": str(alt_p),
                        "Ошибка": f"{type(ex).__name__}: {ex}", "trace": traceback.format_exc(limit=3)}
 
 
@@ -686,7 +718,7 @@ def build_jobs(args, cfg):
                     if k in rmap:
                         jobs.append((k or d.name, rmap[k], p, args.out, cfg))
                     else:
-                        log.warning("Нет эталона для %s", p)
+                        log.warning("Нет РН-ПД для %s", p)
     else:
         raise SystemExit("Укажите --root, или --ref-dir и --alt-dir, или --manifest")
     return jobs
@@ -732,7 +764,7 @@ def run_batch(args, cfg, progress=None, cancel=None):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="Сравнение альтернативных траекторий скважин")
+    ap = argparse.ArgumentParser(description="Сравнение траекторий скважин РН-ПД и РНТ")
     sub = ap.add_subparsers(dest="cmd", required=True)
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("-o", "--out", default="out")
@@ -746,10 +778,16 @@ def main(argv=None):
     p2.add_argument("--root", help="папка; в каждой подпапке пара файлов")
     p2.add_argument("--ref-dir"); p2.add_argument("--alt-dir")
     p2.add_argument("--manifest", help="CSV с колонками well;ref;alt")
-    p2.add_argument("--ref-pattern", default=r"точн|exact|ref|факт|план")
-    p2.add_argument("--alt-pattern", default=r"альтерн|alt")
+    p2.add_argument("--ref-pattern", default=r"рн-?пд|точн|exact|ref|факт|план")
+    p2.add_argument("--alt-pattern", default=r"рнт|альтерн|alt")
     p2.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
     p2.add_argument("--skip-existing", action="store_true", help="пропускать уже посчитанные")
+    p3 = sub.add_parser("workbook", parents=[common],
+                        help="РН-ПД — одна Excel-книга (лист = скважина), РНТ — CSV; результат — одна книга")
+    p3.add_argument("--ref-xlsx", required=True, help="Excel-книга с траекториями РН-ПД, лист = скважина")
+    p3.add_argument("--alt", required=True, help="папка с CSV (файл на скважину) или один CSV с колонкой «Скважина»")
+    p3.add_argument("--csv-sep", default=",", help="разделитель CSV (по умолчанию запятая; auto — определить)")
+    p3.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
     a = ap.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -762,7 +800,13 @@ def main(argv=None):
     if a.no_plots:
         cfg["plots"] = False
 
-    if a.cmd == "pair":
+    if a.cmd == "workbook":
+        global CSV_SEP
+        CSV_SEP = a.csv_sep
+        import workbook_mode
+        out = a.out if a.out.lower().endswith(".xlsx") else str(Path(a.out) / "Сравнение_траекторий.xlsx")
+        workbook_mode.run_workbook(a.ref_xlsx, a.alt, out, cfg, a.workers)
+    elif a.cmd == "pair":
         res = run_pair(a.ref, a.alt, a.out, cfg, a.well)
         for k, v in res.row.items():
             print(f"{k:45s} {v:.2f}" if isinstance(v, float) else f"{k:45s} {v}")

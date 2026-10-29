@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-TrajCompare — оконная программа сравнения альтернативных траекторий скважин.
+TrajCompare — оконная программа сравнения траекторий скважин РН-ПД и РНТ.
 Точка входа для сборки в .exe (PyInstaller).
 
 Без аргументов — открывается окно.
@@ -84,10 +84,11 @@ def run_gui():
          if k in ("step_md", "wellhead_tol", "target_tol", "sep_tol", "sep_warn", "landing_inc")}
     plots_var = tk.BooleanVar(value=saved.get("plots", True))
     paths = {k: tk.StringVar(value=saved.get("_" + k, "")) for k in
-             ("ref", "alt", "out_pair", "root", "ref_dir", "alt_dir", "manifest", "out_batch")}
+             ("ref", "alt", "out_pair", "root", "ref_dir", "alt_dir", "manifest", "out_batch",
+              "wb_ref", "wb_alt", "wb_out")}
     mode = tk.StringVar(value=saved.get("_mode", "root"))
-    ref_pat = tk.StringVar(value=saved.get("_ref_pattern", r"точн|exact|ref|факт|план"))
-    alt_pat = tk.StringVar(value=saved.get("_alt_pattern", r"альтерн|alt"))
+    ref_pat = tk.StringVar(value=saved.get("_ref_pattern", r"рн-?пд|точн|exact|ref|факт|план"))
+    alt_pat = tk.StringVar(value=saved.get("_alt_pattern", r"рнт|альтерн|alt"))
     workers = tk.IntVar(value=saved.get("_workers", max(1, (os.cpu_count() or 2) - 1)))
     skip_var = tk.BooleanVar(value=saved.get("_skip", False))
 
@@ -106,7 +107,7 @@ def run_gui():
         d["plots"] = bool(plots_var.get())
         d.update({"_" + k: v.get() for k, v in paths.items()})
         d.update(_mode=mode.get(), _ref_pattern=ref_pat.get(), _alt_pattern=alt_pat.get(),
-                 _workers=int(workers.get()), _skip=bool(skip_var.get()))
+                 _workers=int(workers.get()), _skip=bool(skip_var.get()), _csv_sep=csv_sep.get())
         try:
             SETTINGS_FILE.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
         except Exception:  # noqa: BLE001
@@ -118,7 +119,12 @@ def run_gui():
         ttk.Entry(parent, textvariable=var).grid(row=r, column=1, sticky="ew", padx=6, pady=4)
 
         def browse():
-            if kind == "file":
+            if kind == "save":
+                p = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel", "*.xlsx")],
+                                                 initialfile="Сравнение_траекторий.xlsx")
+            elif kind == "csvdir":
+                p = filedialog.askopenfilename(filetypes=[("CSV", "*.csv"), ("Все", "*.*")])
+            elif kind == "file":
                 p = filedialog.askopenfilename(filetypes=ftypes or [("Excel", "*.xlsx *.xlsm *.xls"), ("Все", "*.*")])
             else:
                 p = filedialog.askdirectory()
@@ -129,14 +135,63 @@ def run_gui():
     nb = ttk.Notebook(root)
     nb.pack(fill="both", expand=True, padx=8, pady=(8, 0))
 
+    # ================= Вкладка «Книга + CSV» =================
+    t0 = ttk.Frame(nb, padding=8)
+    nb.add(t0, text="  Книга РН-ПД + CSV  ")
+    t0.columnconfigure(1, weight=1)
+    path_row(t0, 0, "Книга РН-ПД (лист = скважина):", paths["wb_ref"], "file")
+    ttk.Label(t0, text="РНТ (CSV):").grid(row=1, column=0, sticky="w", padx=6, pady=4)
+    ttk.Entry(t0, textvariable=paths["wb_alt"]).grid(row=1, column=1, sticky="ew", padx=6, pady=4)
+    altb = ttk.Frame(t0)
+    altb.grid(row=1, column=2, padx=6)
+
+    def pick_alt_dir():
+        p = filedialog.askdirectory()
+        if p:
+            paths["wb_alt"].set(p)
+
+    def pick_alt_file():
+        p = filedialog.askopenfilename(filetypes=[("CSV", "*.csv"), ("Все", "*.*")])
+        if p:
+            paths["wb_alt"].set(p)
+    ttk.Button(altb, text="Папка…", command=pick_alt_dir).pack(side="left")
+    ttk.Button(altb, text="Файл…", command=pick_alt_file).pack(side="left", padx=(4, 0))
+    ttk.Label(t0, foreground="#666", text="Папка с CSV (файл на скважину, номер скважины в имени файла) "
+              "или один CSV с колонкой «Скважина». Разделитель — запятая.").grid(row=2, column=1, sticky="w", padx=6)
+    path_row(t0, 3, "Итоговый файл:", paths["wb_out"], "save")
+    ttk.Label(t0, foreground="#666", text="Один Excel-файл: лист «Сводная», затем лист на каждую скважину, "
+              "в конце «Ошибки».").grid(row=4, column=1, sticky="w", padx=6)
+    o0 = ttk.Frame(t0)
+    o0.grid(row=5, column=0, columnspan=3, sticky="w", padx=6, pady=4)
+    ttk.Label(o0, text="Процессов:").pack(side="left")
+    ttk.Spinbox(o0, from_=1, to=64, textvariable=workers, width=4).pack(side="left", padx=4)
+    ttk.Label(o0, text="   Разделитель CSV:").pack(side="left")
+    csv_sep = tk.StringVar(value=saved.get("_csv_sep", ","))
+    ttk.Combobox(o0, textvariable=csv_sep, values=[",", ";", "auto"], width=6, state="readonly").pack(side="left", padx=4)
+    b0 = ttk.Frame(t0)
+    b0.grid(row=6, column=0, columnspan=3, sticky="w", padx=6, pady=6)
+    run0 = ttk.Button(b0, text="▶  Сравнить все скважины")
+    stop0 = ttk.Button(b0, text="■  Остановить", state="disabled")
+    open0 = ttk.Button(b0, text="Открыть итоговый файл", state="disabled")
+    for b in (run0, stop0, open0):
+        b.pack(side="left", padx=(0, 8))
+    pb0 = ttk.Progressbar(t0, mode="determinate")
+    pb0.grid(row=7, column=0, columnspan=3, sticky="ew", padx=6)
+    stat0 = ttk.Label(t0, text="")
+    stat0.grid(row=8, column=0, columnspan=3, sticky="w", padx=6)
+    log0 = tk.Text(t0, height=12, font=("Consolas", 9), relief="flat", bg="#f7f7f7")
+    log0.grid(row=9, column=0, columnspan=3, sticky="nsew", padx=6, pady=6)
+    t0.rowconfigure(9, weight=1)
+    cancel0 = threading.Event()
+
     # ================= Вкладка «Одна пара» =================
     t1 = ttk.Frame(nb, padding=8)
     nb.add(t1, text="  Одна пара  ")
     t1.columnconfigure(1, weight=1)
-    path_row(t1, 0, "Эталон (точное):", paths["ref"], "file")
-    path_row(t1, 1, "Альтернатива:", paths["alt"], "file")
+    path_row(t1, 0, "РН-ПД:", paths["ref"], "file")
+    path_row(t1, 1, "РНТ:", paths["alt"], "file")
     path_row(t1, 2, "Папка результатов:", paths["out_pair"], "dir")
-    ttk.Label(t1, text="Если папка не указана — результаты кладутся рядом с файлом эталона, в папку «Сравнение».",
+    ttk.Label(t1, text="Если папка не указана — результаты кладутся рядом с файлом РН-ПД, в папку «Сравнение».",
               foreground="#666").grid(row=3, column=1, sticky="w", padx=6)
 
     btns1 = ttk.Frame(t1)
@@ -163,13 +218,13 @@ def run_gui():
     mf = ttk.LabelFrame(t2, text="Как найти пары файлов", padding=6)
     mf.grid(row=0, column=0, columnspan=3, sticky="ew")
     mf.columnconfigure(1, weight=1)
-    ttk.Radiobutton(mf, text="Одна папка: в каждой подпапке эталон + альтернатива", variable=mode,
+    ttk.Radiobutton(mf, text="Одна папка: в каждой подпапке РН-ПД + РНТ", variable=mode,
                     value="root").grid(row=0, column=0, columnspan=3, sticky="w")
     path_row(mf, 1, "   Папка со скважинами:", paths["root"], "dir")
-    ttk.Radiobutton(mf, text="Две папки: эталоны и альтернативы (пары по номеру скважины = имя листа/файла)",
+    ttk.Radiobutton(mf, text="Две папки: РН-ПД и РНТ (пары по номеру скважины = имя листа/файла)",
                     variable=mode, value="dirs").grid(row=2, column=0, columnspan=3, sticky="w")
-    path_row(mf, 3, "   Папка эталонов:", paths["ref_dir"], "dir")
-    path_row(mf, 4, "   Папка альтернатив:", paths["alt_dir"], "dir")
+    path_row(mf, 3, "   Папка РН-ПД:", paths["ref_dir"], "dir")
+    path_row(mf, 4, "   Папка РНТ:", paths["alt_dir"], "dir")
     ttk.Radiobutton(mf, text="Список пар CSV (колонки well;ref;alt)", variable=mode,
                     value="manifest").grid(row=5, column=0, columnspan=3, sticky="w")
     path_row(mf, 6, "   Файл CSV:", paths["manifest"], "file", [("CSV", "*.csv"), ("Все", "*.*")])
@@ -180,9 +235,9 @@ def run_gui():
     path_row(of, 0, "Папка результатов:", paths["out_batch"], "dir")
     opt = ttk.Frame(t2)
     opt.grid(row=2, column=0, columnspan=3, sticky="w", padx=6, pady=4)
-    ttk.Label(opt, text="Признак эталона в имени:").pack(side="left")
+    ttk.Label(opt, text="Признак РН-ПД в имени:").pack(side="left")
     ttk.Entry(opt, textvariable=ref_pat, width=22).pack(side="left", padx=4)
-    ttk.Label(opt, text="альтернативы:").pack(side="left")
+    ttk.Label(opt, text="РНТ:").pack(side="left")
     ttk.Entry(opt, textvariable=alt_pat, width=14).pack(side="left", padx=4)
     ttk.Label(opt, text="  Процессов:").pack(side="left")
     ttk.Spinbox(opt, from_=1, to=64, textvariable=workers, width=4).pack(side="left", padx=4)
@@ -243,7 +298,7 @@ def run_gui():
     def do_pair():
         ref, alt = paths["ref"].get().strip(), paths["alt"].get().strip()
         if not (ref and alt):
-            messagebox.showwarning(APP_TITLE, "Выберите файл эталона и файл альтернативы.")
+            messagebox.showwarning(APP_TITLE, "Выберите файл РН-ПД и файл РНТ.")
             return
         try:
             c = cfg()
@@ -307,6 +362,43 @@ def run_gui():
                 q.put(("batch_err", f"{type(ex).__name__}: {ex}\n{traceback.format_exc(limit=4)}"))
         threading.Thread(target=work, daemon=True).start()
 
+
+    def do_workbook():
+        ref, alt = paths["wb_ref"].get().strip(), paths["wb_alt"].get().strip()
+        if not (ref and alt):
+            messagebox.showwarning(APP_TITLE, "Выберите книгу РН-ПД и CSV РНТ (папку или файл).")
+            return
+        try:
+            c = cfg()
+        except ValueError as ex:
+            messagebox.showerror(APP_TITLE, str(ex))
+            return
+        out = paths["wb_out"].get().strip() or str(Path(ref).with_name("Сравнение_траекторий.xlsx"))
+        if not out.lower().endswith(".xlsx"):
+            out += ".xlsx"
+        paths["wb_out"].set(out)
+        save_settings()
+        tc.CSV_SEP = csv_sep.get()
+        cancel0.clear()
+        run0.config(state="disabled"); stop0.config(state="normal"); open0.config(state="disabled")
+        log0.delete("1.0", "end"); pb0.config(value=0, maximum=1)
+        status.config(text="Идёт сравнение…")
+        import workbook_mode as wm
+
+        def work():
+            try:
+                rows, errs, path = wm.run_workbook(ref, alt, out, c, max(1, int(workers.get())),
+                                                   progress=lambda i, n, r: q.put(("wb_prog", (i, n, r))),
+                                                   cancel=cancel0.is_set)
+                q.put(("wb_done", (rows, errs, path)))
+            except PermissionError:
+                q.put(("wb_err", f"Не удалось записать {out}.\nВозможно, файл открыт в Excel — закройте его и повторите."))
+            except BaseException as ex:  # noqa: BLE001
+                q.put(("wb_err", f"{type(ex).__name__}: {ex}\n{traceback.format_exc(limit=4)}"))
+        threading.Thread(target=work, daemon=True).start()
+
+    run0.config(command=do_workbook)
+    stop0.config(command=lambda: (cancel0.set(), status.config(text="Остановка… итоговый файл будет записан по готовым скважинам")))
     run1.config(command=do_pair)
     run2.config(command=do_batch)
     stop2.config(command=lambda: (cancel_flag.set(), status.config(text="Остановка после текущих пар…")))
@@ -316,8 +408,29 @@ def run_gui():
         try:
             while True:
                 kind, data = q.get_nowait()
-                if kind == "log":
-                    logbox.insert("end", data + "\n"); logbox.see("end")
+                if kind == "wb_prog":
+                    i, n, r = data
+                    pb0.config(maximum=max(n, 1), value=i)
+                    stat0.config(text=f"Посчитано {i} из {n}")
+                    msg = r.get("Вердикт") or ("ОШИБКА: " + str(r.get("Ошибка", "")))
+                    log0.insert("end", f"{r.get('Скважина')}: {msg}\n"); log0.see("end")
+                elif kind in ("wb_done", "wb_err"):
+                    run0.config(state="normal"); stop0.config(state="disabled")
+                    if kind == "wb_err":
+                        status.config(text="Ошибка")
+                        messagebox.showerror(APP_TITLE, data)
+                    else:
+                        rows, errs, path = data
+                        open0.config(state="normal", command=lambda p=path: open_path(p))
+                        vc = {}
+                        for r in rows:
+                            vc[r["row"]["Вердикт"]] = vc.get(r["row"]["Вердикт"], 0) + 1
+                        txt = ", ".join(f"{k}: {v}" for k, v in vc.items()) or "нет сравнённых скважин"
+                        status.config(text=f"Готово. {txt}; проблем: {len(errs)}.  Файл: {path}")
+                        log0.insert("end", f"\nГотово: {path}\n{txt}; проблем: {len(errs)}\n"); log0.see("end")
+                elif kind == "log":
+                    box = log0 if nb.index(nb.select()) == 0 else logbox
+                    box.insert("end", data + "\n"); box.see("end")
                 elif kind == "pair_done":
                     row, out, well = data
                     v = row["Вердикт"]
@@ -367,7 +480,7 @@ def run_gui():
                         status.config(text=f"Готово. {txt}; ошибок: {len(errs)}.  Результаты: {out}")
                         if not rows and not errs:
                             messagebox.showinfo(APP_TITLE, "Пары файлов не найдены. Проверьте папку и признаки "
-                                                           "эталона/альтернативы в именах файлов.")
+                                                           "РН-ПД/РНТ в именах файлов.")
         except queue.Empty:
             pass
         root.after(150, poll)

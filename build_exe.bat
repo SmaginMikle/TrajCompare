@@ -29,7 +29,7 @@ python -m pip install -q -r requirements.txt pyinstaller || goto :err
 echo Собираю exe (2-5 минут)...
 pyinstaller --noconfirm --clean --onefile --windowed ^
   --name TrajCompare ^
-  --hidden-import mpl_toolkits.mplot3d ^
+  --hidden-import mpl_toolkits.mplot3d --hidden-import workbook_mode ^
   --exclude-module scipy --exclude-module IPython --exclude-module PyQt5 --exclude-module PySide6 ^
   trajcompare_gui.py || goto :err
 
