@@ -81,7 +81,7 @@ def run_gui():
         except Exception:  # noqa: BLE001
             saved = {}
     S = {k: tk.StringVar(value=str(saved.get(k, v))) for k, v in tc.DEFAULTS.items()
-         if k in ("step_md", "wellhead_tol", "target_tol", "sep_tol", "sep_warn", "landing_inc")}
+         if k in ("step_md", "wellhead_tol", "target_tol", "sep_tol", "sep_warn", "landing_inc", "ddi_tol")}
     plots_var = tk.BooleanVar(value=saved.get("plots", True))
     paths = {k: tk.StringVar(value=saved.get("_" + k, "")) for k in
              ("ref", "alt", "out_pair", "root", "ref_dir", "alt_dir", "manifest", "out_batch",
@@ -270,6 +270,7 @@ def run_gui():
         "sep_tol": "Расхождение стволов для «Сходятся», м",
         "sep_warn": "Расхождение стволов для «Условно сходятся», м",
         "landing_inc": "Зенит начала горизонтального участка, град",
+        "ddi_tol": "Разница DDI, при которой траектории «сопоставимы»",
     }
     for i, (k, lab) in enumerate(LABELS.items()):
         ttk.Label(t3, text=lab).grid(row=i, column=0, sticky="w", pady=5)
@@ -286,6 +287,8 @@ def run_gui():
         "\nЦели берутся из колонки комментариев (метки Т1, Т2, T3…). Если меток нет — целью считается забой.\n"
         "Вердикт «Сходятся»: устья и цели в допуске и макс. расхождение стволов ≤ первого порога.\n"
         "«Условно сходятся»: устья и цели в допуске, расхождение ≤ второго порога. Иначе — «Не сходятся».\n"
+        "\nDDI = log10(AHD · MD · Tortuosity / TVD) — индекс сложности проводки (Oag & Williams, 2000).\n"
+        "Шкала: < 6,0 низкая; 6,0–6,4 средняя; 6,4–6,8 высокая; ≥ 6,8 экстремальная.\n"
         f"\nНастройки сохраняются в {SETTINGS_FILE.name} рядом с программой."
     )).grid(row=len(LABELS) + 2, column=0, columnspan=3, sticky="w")
 

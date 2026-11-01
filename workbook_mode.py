@@ -165,6 +165,10 @@ def write_result_book(results: list[dict], errors: list[dict], out_path, cfg, so
     thin = Side(style="thin", color="D0D0D0")
     BOX = Border(left=thin, right=thin, top=thin, bottom=thin)
     VF = {k: PatternFill("solid", fgColor=v) for k, v in tc.VERDICT_FILL.items()}
+    # Цвета категорий DDI и результата сравнения по DDI
+    DF = {k: PatternFill("solid", fgColor=c) for k, c in {
+        "Низкая": "C6EFCE", "Средняя": "FFEB9C", "Высокая": "F8CBAD", "Экстремальная": "FF9B9B",
+        "РНТ проще": "C6EFCE", "сопоставимы": "EDEDED", "РНТ сложнее": "F8CBAD"}.items()}
     WRAP = Alignment(wrap_text=True, vertical="center", horizontal="center")
 
     def put_table(ws, r0, c0, df: pd.DataFrame, fmt="0.00"):
@@ -208,17 +212,29 @@ def write_result_book(results: list[dict], errors: list[dict], out_path, cfg, so
         ("Допуски", f"цель {cfg['target_tol']:g} м, устье {cfg['wellhead_tol']:g} м, "
                     f"стволы {cfg['sep_tol']:g} / {cfg['sep_warn']:g} м"),
     ]
+    if len(df) and "DDI РН-ПД" in df.columns:
+        dc = df["Сравнение по DDI"].value_counts()
+        stats += [
+            ("Средний DDI РН-ПД / РНТ", f"{df['DDI РН-ПД'].mean():.2f} / {df['DDI РНТ'].mean():.2f}"),
+            ("РНТ проще по DDI", int(dc.get("РНТ проще", 0))),
+            ("РНТ сложнее по DDI", int(dc.get("РНТ сложнее", 0))),
+            ("DDI сопоставимы", int(dc.get("сопоставимы", 0))),
+            ("Шкала DDI", "< 6,0 низкая; 6,0–6,4 средняя; 6,4–6,8 высокая; ≥ 6,8 экстремальная; "
+                          f"«сопоставимы» — |ΔDDI| < {cfg.get('ddi_tol', 0.1):g}"),
+        ]
     for i, (k, v) in enumerate(stats, 3):
         ws.cell(i, 1, k).font = Font(bold=True)
         c = ws.cell(i, 2, v)
         c.alignment = Alignment(horizontal="left")
         if k in VF:
             c.fill = VF[k]
-    if errors:
-        ws.cell(3 + len(stats) - 2, 3, "→ см. лист «Ошибки»").hyperlink = "#'Ошибки'!A1"
+        if k == "Проблем (без пары / ошибки)" and errors:
+            ws.cell(i, 3, "→ см. лист «Ошибки»").hyperlink = "#'Ошибки'!A1"
     r0 = 3 + len(stats) + 1
-    cols_order = [c for c in ["Скважина", "Вердикт", "Причины"] if c in df.columns] + \
-                 [c for c in df.columns if c not in ("Скважина", "Вердикт", "Причины", "РН-ПД", "РНТ")]
+    first = ["Скважина", "Вердикт", "Причины", "Сравнение по DDI", "DDI РН-ПД", "DDI РНТ", "ΔDDI (РНТ−РН-ПД)",
+             "Сложность РН-ПД", "Сложность РНТ"]
+    cols_order = [c for c in first if c in df.columns] + \
+                 [c for c in df.columns if c not in first + ["РН-ПД", "РНТ"]]
     if len(df):
         df = df[cols_order]
         last = put_table(ws, r0, 1, df)
@@ -231,6 +247,13 @@ def write_result_book(results: list[dict], errors: list[dict], out_path, cfg, so
             v = ws.cell(i, 2)
             if v.value in VF:
                 v.fill = VF[v.value]
+            for j, col in enumerate(df.columns, 1):
+                if col in ("Сложность РН-ПД", "Сложность РНТ", "Сравнение по DDI"):
+                    cc = ws.cell(i, j)
+                    if cc.value in DF:
+                        cc.fill = DF[cc.value]
+                elif col.startswith("DDI") or col.startswith("ΔDDI"):
+                    ws.cell(i, j).number_format = "0.000"
         ws.auto_filter.ref = f"A{r0}:{get_column_letter(len(df.columns))}{last - 1}"
         ws.freeze_panes = ws.cell(r0 + 1, 2)
     ws.column_dimensions["A"].width = 34
@@ -267,7 +290,17 @@ def write_result_book(results: list[dict], errors: list[dict], out_path, cfg, so
                 sh.cell(i, 2).fill = VF.get(v, PatternFill())
         r += 1
         sh.cell(r, 1, "Параметры траекторий").font = SEC
-        r = put_table(sh, r + 1, 1, res["summary"])
+        r_par = r + 1
+        r = put_table(sh, r_par, 1, res["summary"])
+        for rr in list(range(7, r_par)) + list(range(r_par + 1, r)):
+            for cc in (2, 3):
+                cell = sh.cell(rr, cc)
+                if isinstance(cell.value, str) and cell.value in DF:
+                    cell.fill = DF[cell.value]
+            if str(sh.cell(rr, 1).value or "").startswith(("DDI", "ΔDDI")):
+                for cc in (2, 3, 4):
+                    if isinstance(sh.cell(rr, cc).value, float):
+                        sh.cell(rr, cc).number_format = "0.000"
 
         img_bottom = 5
         if res.get("png"):

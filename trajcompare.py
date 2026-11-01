@@ -55,6 +55,8 @@ DEFAULTS = dict(
     dpi=130,
     dpi_embed=80,           # разрешение графиков, вставляемых в общую книгу
     profile_step=25.0,      # шаг таблицы расхождения на листе скважины, м
+    ddi_bounds=[6.0, 6.4, 6.8],   # границы категорий DDI (Oag & Williams, метрическая шкала)
+    ddi_tol=0.1,            # разница DDI, которую считаем существенной
 )
 
 # Синонимы заголовков (нормализованные, нижний регистр). Порядок = приоритет.
@@ -286,6 +288,33 @@ def dls(t: Trajectory):
     return np.r_[0, np.where(dmd > 0, b / dmd * 10, 0)], b
 
 
+DDI_CATS = ["Низкая", "Средняя", "Высокая", "Экстремальная"]
+
+
+def ddi(t: Trajectory, cfg=DEFAULTS) -> dict:
+    """Directional Difficulty Index (Oag & Williams, SPE/IADC 59196, 2000), метрическая версия.
+
+    DDI = log10( AHD · MD · Tortuosity / TVD )
+      AHD        — горизонтальный путь вдоль ствола (сумма длин проекций интервалов на план), м
+      MD         — длина ствола, м
+      Tortuosity — сумма пространственных углов искривления по всем интервалам, град
+      TVD        — вертикальная глубина забоя от устья, м
+    Категории: < 6.0 низкая, 6.0–6.4 средняя, 6.4–6.8 высокая, ≥ 6.8 экстремальная.
+    """
+    _, beta = dls(t)
+    ahd = float(np.hypot(np.diff(t.n), np.diff(t.e)).sum())
+    md = float(t.md[-1] - t.md[0])
+    tort = float(beta.sum())
+    tvd = float(t.tvd[-1] - t.tvd[0]) if np.all(np.isfinite(t.tvd)) else float(t.z[-1] - t.z[0])
+    val = np.nan
+    if ahd > 0 and md > 0 and tort > 0 and tvd > 0:
+        val = float(np.log10(ahd * md * tort / tvd))
+    b = cfg.get("ddi_bounds", DEFAULTS["ddi_bounds"])
+    cat = "—" if np.isnan(val) else DDI_CATS[int(np.searchsorted(b, val, side="right"))]
+    return {"DDI": val, "Категория DDI": cat, "AHD (путь в плане), м": ahd,
+            "Tortuosity (сумма искривлений), град": tort, "TVD забоя от устья, м": tvd}
+
+
 def traj_params(t: Trajectory, cfg) -> dict:
     d10, beta = dls(t)
     hd = np.hypot(t.n - t.n[0], t.e - t.e[0])
@@ -302,7 +331,13 @@ def traj_params(t: Trajectory, cfg) -> dict:
             best = (dev, o)
     n0, e0, z0, _ = min_curvature(t.md, t.inc, t.azi, t.n[0], t.e[0], t.z[0])
     dev0 = np.sqrt((n0 - t.n) ** 2 + (e0 - t.e) ** 2 + (z0 - t.z) ** 2).max()
+    dd = ddi(t, cfg)
     return {
+        "DDI (индекс сложности)": dd["DDI"],
+        "Категория сложности по DDI": dd["Категория DDI"],
+        "AHD — горизонтальный путь вдоль ствола, м": dd["AHD (путь в плане), м"],
+        "Tortuosity — сумма искривлений, град": dd["Tortuosity (сумма искривлений), град"],
+        "TVD забоя от устья, м": dd["TVD забоя от устья, м"],
         "Длина по стволу, м": t.md[-1] - t.md[0],
         "Вертикальная глубина конца (TVDSS), м": t.z[-1],
         "Отход на забое, м": hd[-1],
@@ -408,6 +443,13 @@ def compare(ref: Trajectory, alt: Trajectory, cfg=DEFAULTS, well: str | None = N
     else:
         verdict = "Не сходятся"
 
+    d_r, d_a = pr["DDI (индекс сложности)"], pa["DDI (индекс сложности)"]
+    if np.isnan(d_r) or np.isnan(d_a):
+        ddi_cmp = "нет данных"
+    elif abs(d_a - d_r) < cfg.get("ddi_tol", 0.1):
+        ddi_cmp = "сопоставимы"
+    else:
+        ddi_cmp = "РНТ проще" if d_a < d_r else "РНТ сложнее"
     row = {
         "Скважина": well, "РН-ПД": Path(ref.path).name, "РНТ": Path(alt.path).name,
         "Вердикт": verdict, "Причины": "; ".join(reasons),
@@ -419,12 +461,17 @@ def compare(ref: Trajectory, alt: Trajectory, cfg=DEFAULTS, well: str | None = N
         "P95 расхождения, м": float(np.percentile(d_ra, 95)),
         "RMS расхождения, м": float(np.sqrt((d_ra ** 2).mean())),
         f"Доля ствола в пределах {cfg['sep_tol']:.0f} м, %": within,
+        "DDI РН-ПД": d_r, "DDI РНТ": d_a, "ΔDDI (РНТ−РН-ПД)": d_a - d_r,
+        "Сложность РН-ПД": pr["Категория сложности по DDI"], "Сложность РНТ": pa["Категория сложности по DDI"],
+        "Сравнение по DDI": ddi_cmp,
+        "Tortuosity РН-ПД, °": pr["Tortuosity — сумма искривлений, град"],
+        "Tortuosity РНТ, °": pa["Tortuosity — сумма искривлений, град"],
         "Длина РН-ПД, м": pr["Длина по стволу, м"], "Длина РНТ, м": pa["Длина по стволу, м"],
         "ΔДлины (РНТ−РН-ПД), м": pa["Длина по стволу, м"] - pr["Длина по стволу, м"],
         "Макс. DLS РН-ПД, °/10м": pr["Макс. интенсивность, град/10 м"],
-        "Макс. DLS альт., °/10м": pa["Макс. интенсивность, град/10 м"],
+        "Макс. DLS РНТ, °/10м": pa["Макс. интенсивность, град/10 м"],
         "QC поправка азимута РН-ПД, °": pr["QC: поправка азимута, совмещающая с координатами, град"],
-        "QC поправка азимута альт., °": pa["QC: поправка азимута, совмещающая с координатами, град"],
+        "QC поправка азимута РНТ, °": pa["QC: поправка азимута, совмещающая с координатами, град"],
     }
     return PairResult(well, ref, alt, summary, targets, profile, row)
 
@@ -444,7 +491,8 @@ def plot_pair(res: PairResult, out_png, cfg=DEFAULTS, dpi=None):
     tg = res.targets[res.targets["Цель"] == "да"]
 
     fig = plt.figure(figsize=(20, 10.5))
-    fig.suptitle(f"Скважина {res.well}: {r.name} vs {a.name} — {res.row['Вердикт']} "
+    fig.suptitle(f"Скважина {res.well}: {r.name} vs {a.name} — {res.row['Вердикт']}; "
+                 f"DDI {res.row['DDI РН-ПД']:.2f} / {res.row['DDI РНТ']:.2f} "
                  f"(макс. расхождение {res.row['Макс. расхождение (Хаусдорф), м']:.1f} м)",
                  fontsize=14, weight="bold")
     gs = fig.add_gridspec(2, 4, hspace=0.32, wspace=0.28)
@@ -770,7 +818,7 @@ def main(argv=None):
     common.add_argument("-o", "--out", default="out")
     common.add_argument("--config", help="JSON с настройками (допуски, шаг, регулярка целей)")
     common.add_argument("--no-plots", action="store_true")
-    for k in ("step_md", "target_tol", "sep_tol", "sep_warn", "wellhead_tol", "landing_inc"):
+    for k in ("step_md", "target_tol", "sep_tol", "sep_warn", "wellhead_tol", "landing_inc", "ddi_tol"):
         common.add_argument("--" + k.replace("_", "-"), type=float)
     p1 = sub.add_parser("pair", parents=[common])
     p1.add_argument("ref"); p1.add_argument("alt"); p1.add_argument("--well")
@@ -794,7 +842,7 @@ def main(argv=None):
     cfg = dict(DEFAULTS)
     if a.config:
         cfg.update(json.loads(Path(a.config).read_text(encoding="utf-8")))
-    for k in ("step_md", "target_tol", "sep_tol", "sep_warn", "wellhead_tol", "landing_inc"):
+    for k in ("step_md", "target_tol", "sep_tol", "sep_warn", "wellhead_tol", "landing_inc", "ddi_tol"):
         if getattr(a, k, None) is not None:
             cfg[k] = getattr(a, k)
     if a.no_plots:

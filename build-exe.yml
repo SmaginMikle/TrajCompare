@@ -1,0 +1,75 @@
+name: Build TrajCompare.exe
+
+on:
+  push:
+    branches: ["main", "master"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Check project files
+        shell: pwsh
+        run: |
+          foreach ($f in 'trajcompare.py','trajcompare_gui.py','workbook_mode.py','requirements.txt') {
+            if (-not (Test-Path $f)) {
+              Write-Error "Нет файла $f в корне репозитория. Загрузите файлы из архива TrajCompare_build.zip в корень (не во вложенную папку)."
+              exit 1
+            }
+          }
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build exe
+        run: >
+          pyinstaller --noconfirm --clean --onefile --windowed --name TrajCompare
+          --hidden-import mpl_toolkits.mplot3d --hidden-import workbook_mode
+          --exclude-module scipy --exclude-module IPython --exclude-module PyQt5 --exclude-module PySide6
+          trajcompare_gui.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TrajCompare-windows
+          path: dist/TrajCompare.exe
+          if-no-files-found: error
+
+      - name: Publish to Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: TrajCompare, сборка ${{ github.run_number }}
+          body: |
+            Готовый TrajCompare.exe для Windows 10/11. Скачайте файл ниже в разделе Assets.
+            Собрано из коммита ${{ github.sha }}.
+          files: dist/TrajCompare.exe
+          make_latest: true
+
+      - name: Where to download
+        shell: pwsh
+        run: |
+          "## TrajCompare.exe готов" >> $env:GITHUB_STEP_SUMMARY
+          "Скачать: https://github.com/${{ github.repository }}/releases/latest" >> $env:GITHUB_STEP_SUMMARY
+          "или внизу этой страницы, раздел **Artifacts** → TrajCompare-windows" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Smoke test on samples
+        shell: pwsh
+        run: |
+          if (Test-Path samples\РН-ПД_книга.xlsx) {
+            Start-Process -Wait -FilePath dist\TrajCompare.exe -ArgumentList 'workbook','--ref-xlsx','samples\РН-ПД_книга.xlsx','--alt','samples\РНТ_csv','-o','smoke\result.xlsx','--workers','2'
+            if (-not (Test-Path smoke\result.xlsx)) { Write-Error "Собранный exe не создал итоговый файл"; exit 1 }
+            Write-Host "Smoke test OK"
+          } else { Write-Host "Примеров нет, проверку пропускаю" }
