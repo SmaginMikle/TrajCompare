@@ -55,8 +55,10 @@ DEFAULTS = dict(
     dpi=130,
     dpi_embed=80,           # разрешение графиков, вставляемых в общую книгу
     profile_step=25.0,      # шаг таблицы расхождения на листе скважины, м
+    traj_sheets=True,       # листы с исходными траекториями и формулами DDI в итоговой книге
     ddi_bounds=[6.0, 6.4, 6.8],   # границы категорий DDI (Oag & Williams, метрическая шкала)
     ddi_tol=0.1,            # разница DDI, которую считаем существенной
+    ddi_method="oag",       # "oag" — Oag & Williams (AHD); "closure" — по смещению от устья D и извилистости T
 )
 
 # Синонимы заголовков (нормализованные, нижний регистр). Порядок = приоритет.
@@ -290,29 +292,54 @@ def dls(t: Trajectory):
 
 DDI_CATS = ["Низкая", "Средняя", "Высокая", "Экстремальная"]
 
+# Методики расчёта DDI (переключаются настройкой ddi_method)
+DDI_METHODS = {
+    "oag": "Методика 1 — Oag & Williams: AHD (путь в плане вдоль ствола)",
+    "closure": "Методика 2 — по смещению от устья: D (отход на забое), T по интенсивности",
+}
+DDI_H_LABEL = {"oag": "AHD — горизонтальный путь вдоль ствола, м",
+               "closure": "D — смещение от устья на забое, м"}
+
+
+def interval_dls(t: Trajectory) -> np.ndarray:
+    """Пространственная интенсивность α на интервале (i−1, i], град/10 м; в первой точке 0."""
+    return dls(t)[0]
+
 
 def ddi(t: Trajectory, cfg=DEFAULTS) -> dict:
-    """Directional Difficulty Index (Oag & Williams, SPE/IADC 59196, 2000), метрическая версия.
+    """Directional Difficulty Index. Две методики (cfg["ddi_method"]):
 
-    DDI = log10( AHD · MD · Tortuosity / TVD )
-      AHD        — горизонтальный путь вдоль ствола (сумма длин проекций интервалов на план), м
-      MD         — длина ствола, м
-      Tortuosity — сумма пространственных углов искривления по всем интервалам, град
-      TVD        — вертикальная глубина забоя от устья, м
+    "oag" — Oag & Williams (SPE/IADC 59196, 2000):
+        DDI = log10( AHD · MD · Tortuosity / TVD )
+        AHD — горизонтальный путь вдоль ствола (сумма длин проекций интервалов на план), м;
+        MD, TVD — приращения от устья до забоя; Tortuosity — сумма пространственных углов искривления, град.
+
+    "closure" — по смещению от устья (методика заказчика):
+        D_i = sqrt(ΔX_i² + ΔY_i²)              — смещение от устья (ΔX — на Север, ΔY — на Восток), м
+        T_i = T_(i−1) + α_i/10 · (M_i − M_(i−1)), T_0 = 0 — извилистость, град
+        DDI = log10( M · D · T / V )             — M, V: глубина по стволу и по вертикали на забое, м
     Категории: < 6.0 низкая, 6.0–6.4 средняя, 6.4–6.8 высокая, ≥ 6.8 экстремальная.
     """
-    _, beta = dls(t)
-    ahd = float(np.hypot(np.diff(t.n), np.diff(t.e)).sum())
-    md = float(t.md[-1] - t.md[0])
-    tort = float(beta.sum())
-    tvd = float(t.tvd[-1] - t.tvd[0]) if np.all(np.isfinite(t.tvd)) else float(t.z[-1] - t.z[0])
+    method = cfg.get("ddi_method", "oag")
+    tvd_ok = np.all(np.isfinite(t.tvd))
+    if method == "closure":
+        alpha = interval_dls(t)
+        tort = float(np.sum(alpha[1:] / 10 * np.diff(t.md)))
+        h = float(np.hypot(t.n[-1] - t.n[0], t.e[-1] - t.e[0]))
+        md = float(t.md[-1])
+        tvd = float(t.tvd[-1]) if tvd_ok else float(t.z[-1] - t.z[0])
+    else:
+        _, beta = dls(t)
+        tort = float(beta.sum())
+        h = float(np.hypot(np.diff(t.n), np.diff(t.e)).sum())
+        md = float(t.md[-1] - t.md[0])
+        tvd = float(t.tvd[-1] - t.tvd[0]) if tvd_ok else float(t.z[-1] - t.z[0])
     val = np.nan
-    if ahd > 0 and md > 0 and tort > 0 and tvd > 0:
-        val = float(np.log10(ahd * md * tort / tvd))
+    if h > 0 and md > 0 and tort > 0 and tvd > 0:
+        val = float(np.log10(h * md * tort / tvd))
     b = cfg.get("ddi_bounds", DEFAULTS["ddi_bounds"])
     cat = "—" if np.isnan(val) else DDI_CATS[int(np.searchsorted(b, val, side="right"))]
-    return {"DDI": val, "Категория DDI": cat, "AHD (путь в плане), м": ahd,
-            "Tortuosity (сумма искривлений), град": tort, "TVD забоя от устья, м": tvd}
+    return {"DDI": val, "Категория DDI": cat, "H": h, "MD": md, "T": tort, "TVD": tvd, "method": method}
 
 
 def traj_params(t: Trajectory, cfg) -> dict:
@@ -335,9 +362,10 @@ def traj_params(t: Trajectory, cfg) -> dict:
     return {
         "DDI (индекс сложности)": dd["DDI"],
         "Категория сложности по DDI": dd["Категория DDI"],
-        "AHD — горизонтальный путь вдоль ствола, м": dd["AHD (путь в плане), м"],
-        "Tortuosity — сумма искривлений, град": dd["Tortuosity (сумма искривлений), град"],
-        "TVD забоя от устья, м": dd["TVD забоя от устья, м"],
+        "Методика DDI": DDI_METHODS.get(dd["method"], dd["method"]),
+        DDI_H_LABEL.get(dd["method"], "H, м"): dd["H"],
+        "Tortuosity — сумма искривлений, град": dd["T"],
+        "TVD забоя от устья, м": dd["TVD"],
         "Длина по стволу, м": t.md[-1] - t.md[0],
         "Вертикальная глубина конца (TVDSS), м": t.z[-1],
         "Отход на забое, м": hd[-1],
@@ -462,7 +490,6 @@ def compare(ref: Trajectory, alt: Trajectory, cfg=DEFAULTS, well: str | None = N
         "RMS расхождения, м": float(np.sqrt((d_ra ** 2).mean())),
         f"Доля ствола в пределах {cfg['sep_tol']:.0f} м, %": within,
         "DDI РН-ПД": d_r, "DDI РНТ": d_a, "ΔDDI (РНТ−РН-ПД)": d_a - d_r,
-        "Сложность РН-ПД": pr["Категория сложности по DDI"], "Сложность РНТ": pa["Категория сложности по DDI"],
         "Сравнение по DDI": ddi_cmp,
         "Tortuosity РН-ПД, °": pr["Tortuosity — сумма искривлений, град"],
         "Tortuosity РНТ, °": pa["Tortuosity — сумма искривлений, град"],
@@ -709,7 +736,7 @@ def _worker(job):
     t0 = time.time()
     try:
         res = run_pair(ref_p, alt_p, Path(out_dir) / _safe(well), cfg, well)
-        row = res.row; row["Время, с"] = round(time.time() - t0, 2)
+        row = res.row
         return True, row
     except Exception as ex:  # noqa: BLE001
         return False, {"Скважина": well, "РН-ПД": str(ref_p), "РНТ": str(alt_p),
@@ -818,6 +845,10 @@ def main(argv=None):
     common.add_argument("-o", "--out", default="out")
     common.add_argument("--config", help="JSON с настройками (допуски, шаг, регулярка целей)")
     common.add_argument("--no-plots", action="store_true")
+    common.add_argument("--no-traj", action="store_true", help="не добавлять листы траекторий с формулами DDI")
+    common.add_argument("--ddi-method", choices=["oag", "closure"],
+                        help="методика DDI: oag — Oag & Williams (AHD, по умолчанию); "
+                             "closure — по смещению от устья D и извилистости T")
     for k in ("step_md", "target_tol", "sep_tol", "sep_warn", "wellhead_tol", "landing_inc", "ddi_tol"):
         common.add_argument("--" + k.replace("_", "-"), type=float)
     p1 = sub.add_parser("pair", parents=[common])
@@ -847,6 +878,10 @@ def main(argv=None):
             cfg[k] = getattr(a, k)
     if a.no_plots:
         cfg["plots"] = False
+    if a.no_traj:
+        cfg["traj_sheets"] = False
+    if a.ddi_method:
+        cfg["ddi_method"] = a.ddi_method
 
     if a.cmd == "workbook":
         global CSV_SEP

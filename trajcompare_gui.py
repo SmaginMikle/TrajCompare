@@ -83,6 +83,9 @@ def run_gui():
     S = {k: tk.StringVar(value=str(saved.get(k, v))) for k, v in tc.DEFAULTS.items()
          if k in ("step_md", "wellhead_tol", "target_tol", "sep_tol", "sep_warn", "landing_inc", "ddi_tol")}
     plots_var = tk.BooleanVar(value=saved.get("plots", True))
+    traj_var = tk.BooleanVar(value=saved.get("traj_sheets", True))
+    METHOD_BY_NAME = {v: k for k, v in tc.DDI_METHODS.items()}
+    ddi_method_var = tk.StringVar(value=tc.DDI_METHODS.get(saved.get("ddi_method", "oag"), tc.DDI_METHODS["oag"]))
     paths = {k: tk.StringVar(value=saved.get("_" + k, "")) for k in
              ("ref", "alt", "out_pair", "root", "ref_dir", "alt_dir", "manifest", "out_batch",
               "wb_ref", "wb_alt", "wb_out")}
@@ -100,11 +103,15 @@ def run_gui():
             except ValueError:
                 raise ValueError(f"Неверное значение настройки «{LABELS[k]}»: {v.get()}")
         c["plots"] = bool(plots_var.get())
+        c["traj_sheets"] = bool(traj_var.get())
+        c["ddi_method"] = METHOD_BY_NAME.get(ddi_method_var.get(), "oag")
         return c
 
     def save_settings():
         d = {k: v.get() for k, v in S.items()}
         d["plots"] = bool(plots_var.get())
+        d["traj_sheets"] = bool(traj_var.get())
+        d["ddi_method"] = METHOD_BY_NAME.get(ddi_method_var.get(), "oag")
         d.update({"_" + k: v.get() for k, v in paths.items()})
         d.update(_mode=mode.get(), _ref_pattern=ref_pat.get(), _alt_pattern=alt_pat.get(),
                  _workers=int(workers.get()), _skip=bool(skip_var.get()), _csv_sep=csv_sep.get())
@@ -276,21 +283,33 @@ def run_gui():
         ttk.Label(t3, text=lab).grid(row=i, column=0, sticky="w", pady=5)
         ttk.Entry(t3, textvariable=S[k], width=10).grid(row=i, column=1, sticky="w", padx=10)
     ttk.Checkbutton(t3, text="Строить графики (без них расчёт в 2–3 раза быстрее)",
-                    variable=plots_var).grid(row=len(LABELS), column=0, columnspan=2, sticky="w", pady=8)
+                    variable=plots_var).grid(row=len(LABELS), column=0, columnspan=2, sticky="w", pady=(8, 0))
+    ttk.Checkbutton(t3, text="Добавлять листы с исходными траекториями и формулами DDI "
+                             "(≈ +170 КБ на скважину)",
+                    variable=traj_var).grid(row=len(LABELS) + 1, column=0, columnspan=2, sticky="w", pady=(2, 8))
+    mfr = ttk.Frame(t3)
+    mfr.grid(row=len(LABELS) + 2, column=0, columnspan=3, sticky="w", pady=(0, 8))
+    ttk.Label(mfr, text="Методика расчёта DDI:").pack(side="left")
+    ttk.Combobox(mfr, textvariable=ddi_method_var, values=list(tc.DDI_METHODS.values()),
+                 state="readonly", width=72).pack(side="left", padx=8)
 
     def reset():
         for k, v in S.items():
             v.set(str(tc.DEFAULTS[k]))
         plots_var.set(True)
-    ttk.Button(t3, text="Вернуть по умолчанию", command=reset).grid(row=len(LABELS) + 1, column=0, sticky="w")
+        traj_var.set(True)
+        ddi_method_var.set(tc.DDI_METHODS["oag"])
+    ttk.Button(t3, text="Вернуть по умолчанию", command=reset).grid(row=len(LABELS) + 3, column=0, sticky="w")
     ttk.Label(t3, foreground="#666", justify="left", text=(
         "\nЦели берутся из колонки комментариев (метки Т1, Т2, T3…). Если меток нет — целью считается забой.\n"
         "Вердикт «Сходятся»: устья и цели в допуске и макс. расхождение стволов ≤ первого порога.\n"
         "«Условно сходятся»: устья и цели в допуске, расхождение ≤ второго порога. Иначе — «Не сходятся».\n"
-        "\nDDI = log10(AHD · MD · Tortuosity / TVD) — индекс сложности проводки (Oag & Williams, 2000).\n"
+        "\nDDI — индекс сложности проводки. Методика 1 (Oag & Williams): DDI = log10(AHD · MD · Tortuosity / TVD),\n"
+        "AHD — путь в плане вдоль ствола. Методика 2: DDI = log10(M · D · T / V), D = √(ΔX² + ΔY²) — смещение\n"
+        "от устья на забое, T(i) = T(i−1) + α/10 · (M(i) − M(i−1)) — извилистость по интенсивности α.\n"
         "Шкала: < 6,0 низкая; 6,0–6,4 средняя; 6,4–6,8 высокая; ≥ 6,8 экстремальная.\n"
         f"\nНастройки сохраняются в {SETTINGS_FILE.name} рядом с программой."
-    )).grid(row=len(LABELS) + 2, column=0, columnspan=3, sticky="w")
+    )).grid(row=len(LABELS) + 4, column=0, columnspan=3, sticky="w")
 
     status = ttk.Label(root, text="Готово к работе", anchor="w", padding=(10, 4))
     status.pack(fill="x")
