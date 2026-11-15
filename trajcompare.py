@@ -72,13 +72,16 @@ COLS = {
     "tvd":      ["tvd", "вертикаль"],
     "north":    ["x north", "north", "север", "x (m)"],
     "east":     ["y east", "east", "восток", "y (m)"],
+    "dx":       ["dx", "смещение на север", "смещение от устья на север", "смещ. на север"],
+    "dy":       ["dy", "смещение на восток", "смещение от устья на восток", "смещ. на восток"],
     "comment":  ["коммент", "comment", "пласт", "target", "цель", "маркер"],
     "well":     ["скважина", "скв", "well", "wellname", "well name"],
 }
 EXCLUDE = {  # чтобы "азимут" не схватил магнитный, а "север" — "Север/Восток" локальные
     "azi": ["магнит", "magn", "на точку"],
-    "north": ["dx", "сю"],
-    "east": ["dy", "вз"],
+    "north": ["dx", "сю", "смещ"],
+    "east": ["dy", "вз", "смещ"],
+    "tvd": ["tvdss", "tvd ss", "subsea"],
 }
 
 
@@ -109,21 +112,30 @@ def _pick(headers: list[str], data: pd.DataFrame, key: str):
     for j, h in enumerate(headers):
         if not h:
             continue
-        if any(x in h for x in EXCLUDE.get(key, [])):
+        base = _base(h)
+        exact = base in COLS[key]
+        if not exact and any(x in h for x in EXCLUDE.get(key, [])):
             continue
         for pri, syn in enumerate(COLS[key]):
-            if h.startswith(syn) or (len(syn) > 3 and syn in h):
-                cands.append((pri, j))
+            if exact or h.startswith(syn) or (len(syn) > 3 and syn in h):
+                cands.append((0 if exact else 1, pri, j))
                 break
     if not cands:
         return None
     if key in ("comment", "well"):
-        return min(cands)[1]
+        return min(cands)[2]
     scored = []
-    for pri, j in cands:
+    for exact, pri, j in cands:
         v = _to_num(data.iloc[:, j])
-        scored.append((-v.notna().sum(), -float(np.nanmax(np.abs(v))) if v.notna().any() else 0, pri, j))
+        scored.append((exact, -v.notna().sum(), pri, j))
     return min(scored)[3]
+
+
+def _base(h: str) -> str:
+    """Имя столбца без единиц измерения: «tvd (m)» → «tvd», «зенит, град» → «зенит»."""
+    h = re.sub(r"\(.*?\)|\[.*?\]", "", h)
+    h = re.split(r",\s*(м|m|град|grad|°)\b", h)[0]
+    return re.sub(r"\s+", " ", h).strip(" .,:;")
 
 
 @dataclass
@@ -141,6 +153,10 @@ class Trajectory:
     marks: list = field(default_factory=list)   # [(md, label)]
     azi_source: str = ""
     columns: dict = field(default_factory=dict)
+    fmt: str = ""                 # распознанный формат файла
+    qc_dxy: float = float("nan")  # расхождение dX/dY из файла с координатами, м
+    rel_xy: bool = False          # в файле нет X/Y — координаты в плане отсчитаны от устья
+    rel_z: bool = False           # в файле нет TVDSS — вертикаль отсчитана от устья
 
     @property
     def xyz(self):
@@ -163,35 +179,218 @@ def min_curvature(md, inc, azi, n0=0.0, e0=0.0, z0=0.0):
 
 def _to_num(s: pd.Series) -> pd.Series:
     """Число из ячейки: понимает и точку, и запятую как десятичный разделитель, пробелы в тысячах."""
-    if s.dtype == object:
-        s = s.astype(str).str.replace("\u00a0", "", regex=False).str.replace(" ", "", regex=False) \
+    if not pd.api.types.is_numeric_dtype(s):
+        s = s.astype(object).where(s.notna(), None).astype(str).str.replace("\u00a0", "", regex=False).str.replace(" ", "", regex=False) \
              .str.replace(",", ".", regex=False)
     return pd.to_numeric(s, errors="coerce")
 
 
-def read_csv_raw(path: str | Path) -> pd.DataFrame:
-    """CSV с разделителем-запятой (по умолчанию); кодировка UTF-8 или Windows-1251."""
-    last = None
+# ----------------------------------------------------------------------------
+# Форматы файлов: справочник и автоматическое определение
+# ----------------------------------------------------------------------------
+FORMATS = [
+    {
+        "code": "traj_struct",
+        "name": "Структура файла траекторий",
+        "file": "CSV (текст). Разделитель — запятая; точка с запятой и табуляция тоже распознаются",
+        "note": "Один файл — одна скважина, номер скважины — в имени файла (377Г.csv, РНТ_377Г.csv). "
+                "Первая строка — заголовки, далее точки траектории сверху вниз. Десятичный разделитель — точка.",
+        "columns": [
+            ("MD (m)", "глубина по стволу, м", True),
+            ("INCL (grad)", "зенитный угол, град", True),
+            ("AZIM (grad)", "азимут (картографический), град", True),
+            ("TVDSS (m)", "абсолютная отметка, м (ниже уровня моря — положительная)", False),
+            ("X north (m)", "координата X (Север), м", False),
+            ("Y east (m)", "координата Y (Восток), м", False),
+            ("TVD (m)", "глубина по вертикали от устья, м", False),
+            ("dX (m)", "смещение от устья на Север, м", False),
+            ("dY (m)", "смещение от устья на Восток, м", False),
+        ],
+        "example": "Структура_файла_траекторий_пример.csv",
+    },
+    {
+        "code": "rnpd_profile",
+        "name": "Профиль скважины (выгрузка РН-ПД)",
+        "file": "Excel (.xlsx). Шапка с реквизитами скважины, затем таблица точек",
+        "note": "Строка заголовков таблицы находится автоматически. Азимут берётся картографический, "
+                "если его нет — истинный. Цели — метки Т1, Т2… в столбце «Комментарии».",
+        "columns": [
+            ("Комментарии", "метки целей и реперов (Т1, Т2, ГНО…)", False),
+            ("Глубина по стволу (м)", "глубина по стволу, м", True),
+            ("Зенитный угол (град)", "зенитный угол, град", True),
+            ("Азимут Картографический (град)", "азимут (или «Азимут Истинный»)", True),
+            ("Вертикаль (м)", "глубина по вертикали от устья, м", False),
+            ("Абс. Отметка (м)", "абсолютная отметка, м", False),
+            ("Север (м), Восток (м)", "координаты X и Y, м", False),
+        ],
+        "example": "Профиль_скважины_РН-ПД_пример.xlsx",
+    },
+    {
+        "code": "well_book",
+        "name": "Книга Excel: лист = скважина",
+        "file": "Excel (.xlsx), имя листа — номер скважины",
+        "note": "Каждый лист — траектория одной скважины в любом из форматов выше. "
+                "Используется как источник РН-ПД (и при желании РНТ) в режиме «Книга + CSV».",
+        "columns": [],
+        "example": "Книга_РН-ПД_пример.xlsx",
+    },
+    {
+        "code": "multi_csv",
+        "name": "Один CSV на все скважины",
+        "file": "CSV с дополнительным столбцом «Скважина» (или Well)",
+        "note": "Столбцы — как в «Структуре файла траекторий» плюс номер скважины в каждой строке. "
+                "Программа сама разделит файл по скважинам.",
+        "columns": [("Скважина", "номер скважины", True)],
+        "example": "РНТ_все_скважины_пример.csv",
+    },
+    {
+        "code": "generic",
+        "name": "Произвольная таблица",
+        "file": "CSV, TXT или Excel",
+        "note": "Если формат не узнан, столбцы ищутся по названиям (русским и английским): "
+                "MD/глубина по стволу, INC/зенит, AZI/азимут, TVDSS/абс. отметка, TVD/вертикаль, "
+                "X/North/Север, Y/East/Восток. Без координат они пересчитываются методом минимальной кривизны.",
+        "columns": [],
+        "example": None,
+    },
+]
+FORMAT_NAMES = {f["code"]: f["name"] for f in FORMATS}
+_STRUCT_COLS = {"md", "incl", "azim", "tvdss", "x north", "y east", "tvd", "dx", "dy"}
+
+
+def detect_format(headers: list[str]) -> str:
+    """Код формата по строке заголовков (нормализованной)."""
+    bases = {_base(h) for h in headers if h}
+    if {"md", "incl", "azim"} <= bases and len(bases & _STRUCT_COLS) >= 5:
+        return "traj_struct"
+    joined = " | ".join(headers)
+    if "глубина по стволу" in joined and "зенит" in joined and ("абс" in joined or "вертикаль" in joined):
+        return "rnpd_profile"
+    return "generic"
+
+
+def file_kind(path: str | Path) -> str:
+    """Тип файла по содержимому, а не по расширению: xlsx, xls или text."""
+    with open(path, "rb") as f:
+        head = f.read(8)
+    if head.startswith(b"PK\x03\x04"):
+        return "xlsx"
+    if head.startswith(b"\xd0\xcf\x11\xe0"):
+        return "xls"
+    return "text"
+
+
+def _decode(path) -> tuple[str, str]:
+    data = Path(path).read_bytes()
     for enc in ("utf-8-sig", "cp1251"):
         try:
-            return pd.read_csv(path, sep=None if CSV_SEP == "auto" else CSV_SEP, header=None, dtype=str,
-                               encoding=enc, engine="python", skip_blank_lines=False)
-        except UnicodeDecodeError as ex:
-            last = ex
-    raise ValueError(f"не удалось прочитать CSV {path}: {last}")
+            return data.decode(enc), enc
+        except UnicodeDecodeError:
+            continue
+    return data.decode("latin-1"), "latin-1"
 
 
-CSV_SEP = ","
+def sniff_delimiter(text: str) -> str:
+    """Разделитель CSV. Верный — тот, при котором строка заголовков (с буквами) и строки данных
+    (только числа) делятся на одинаковое число полей. Так «1,5;2,3» с заголовком «MD;Зенит» даёт «;», а не «,»."""
+    lines = [ln for ln in text.splitlines() if ln.strip()][:60]
+    if not lines:
+        return ","
+    letters = re.compile(r"[A-DF-Za-df-zА-Яа-яЁё]")
+    alpha = [ln for ln in lines[:30] if letters.search(ln)]
+    data = [ln for ln in lines if not letters.search(ln)]
+    best, best_n = None, 0
+    for d in (",", ";", "\t", "|"):
+        if not data:
+            n_hdr = max((ln.count(d) + 1 for ln in alpha), default=1)
+            ok = n_hdr >= 3
+        else:
+            counts = [ln.count(d) + 1 for ln in data]
+            mode = max(set(counts), key=counts.count)
+            share = counts.count(mode) / len(counts)
+            ok = mode >= 3 and share >= 0.8 and any(ln.count(d) + 1 == mode for ln in alpha)
+            n_hdr = mode
+        if ok and n_hdr > best_n:
+            best, best_n = d, n_hdr
+    return best or r"\s+"
+
+
+def read_csv_raw(path: str | Path) -> pd.DataFrame:
+    """Текстовая таблица: кодировка (UTF-8 / Windows-1251) и разделитель определяются автоматически."""
+    import io as _io
+    text, _ = _decode(path)
+    sep = sniff_delimiter(text) if CSV_SEP == "auto" else CSV_SEP
+    return pd.read_csv(_io.StringIO(text), sep=sep, header=None, dtype=str, engine="python",
+                       skip_blank_lines=True, on_bad_lines="skip")
+
+
+CSV_SEP = "auto"
+
+
+def read_tables(path: str | Path) -> list[tuple[str | None, pd.DataFrame]]:
+    """Все таблицы файла: [(имя листа или None, сырая таблица)]. Тип файла — по содержимому."""
+    kind = file_kind(path)
+    if kind == "xlsx":
+        with open(path, "rb") as fh:          # по содержимому: расширение может быть любым
+            book = pd.read_excel(fh, sheet_name=None, header=None, engine="openpyxl")
+        return [(str(k), v) for k, v in book.items()]
+    if kind == "xls":
+        try:
+            book = pd.read_excel(path, sheet_name=None, header=None)
+        except ImportError:
+            raise ValueError("файл в старом формате Excel 97–2003 (.xls) — сохраните его как .xlsx")
+        return [(str(k), v) for k, v in book.items()]
+    return [(None, read_csv_raw(path))]
+
+
+def describe_file(path: str | Path) -> dict:
+    """Что программа видит в файле: тип, кодировка, разделитель, формат таблицы, столбцы — для справки и проверки."""
+    path = Path(path)
+    kind = file_kind(path)
+    info = {"Файл": path.name, "Тип по содержимому": {"xlsx": "Excel (.xlsx)", "xls": "Excel 97–2003 (.xls)",
+                                                        "text": "текст (CSV/TXT)"}[kind]}
+    if kind == "text":
+        text, enc = _decode(path)
+        sep = sniff_delimiter(text)
+        info["Кодировка"] = {"utf-8-sig": "UTF-8", "cp1251": "Windows-1251"}.get(enc, enc)
+        info["Разделитель"] = {",": "запятая", ";": "точка с запятой", "\t": "табуляция", "|": "|"}.get(sep, "пробелы")
+    sheets = []
+    for sheet, raw in read_tables(path):
+        try:
+            hr = _find_header_row(raw)
+        except ValueError as ex:
+            sheets.append({"Лист": sheet, "Формат": "не распознан", "Причина": str(ex)})
+            continue
+        headers = [_norm(c) for c in raw.iloc[hr].tolist()]
+        data = raw.iloc[hr + 1:]
+        code = detect_format(headers)
+        cols = {k: _pick(headers, data, k) for k in COLS}
+        if cols.get("azi_grid") is not None:          # как в расчёте: картографический азимут в приоритете
+            cols["azi"] = cols["azi_grid"]
+        cols.pop("azi_grid", None); cols.pop("azi_true", None)
+        wc = cols.get("well")
+        nwell = data.iloc[:, wc].dropna().astype(str).str.strip().nunique() if wc is not None else 0
+        found = {k: str(raw.iloc[hr, v]).replace("\n", " ").strip() for k, v in cols.items() if v is not None}
+        sheets.append({"Лист": sheet, "Формат": FORMAT_NAMES[code] + (f"; скважин в файле: {nwell}" if nwell > 1 else ""),
+                       "Строка заголовков": hr + 1, "Точек": int(_to_num(data.iloc[:, cols["md"]]).notna().sum())
+                       if cols.get("md") is not None else 0, "Столбцы": found})
+    info["Таблицы"] = sheets
+    return info
+
+
+def examples_dir() -> Path:
+    """Папка с примерами файлов (внутри exe — во временной папке распаковки)."""
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+    return base / "examples"
 
 
 def read_trajectory(path: str | Path, name: str = "", sheet: str | None = None) -> Trajectory:
     path = Path(path)
-    if path.suffix.lower() in (".csv", ".txt"):
-        return parse_raw(read_csv_raw(path), name or path.stem, str(path), path.stem)
-    xl = pd.ExcelFile(path)
-    sheet = sheet if sheet is not None else xl.sheet_names[0]
-    raw = pd.read_excel(xl, sheet_name=sheet, header=None)
-    well = sheet if sheet.lower() not in ("sheet1", "лист1") else path.stem
+    tables = read_tables(path)
+    if sheet is not None:
+        tables = [t for t in tables if t[0] == sheet] or tables
+    sh, raw = tables[0]
+    well = sh if sh and sh.lower() not in ("sheet1", "лист1") else path.stem
     return parse_raw(raw, name or path.stem, str(path), well)
 
 
@@ -199,6 +398,7 @@ def parse_raw(raw: pd.DataFrame, name: str, path: str, well: str) -> Trajectory:
     hr = _find_header_row(raw)
     headers = [_norm(c) for c in raw.iloc[hr].tolist()]
     data = raw.iloc[hr + 1:].reset_index(drop=True)
+    fmt = detect_format(headers)
 
     cols = {k: _pick(headers, data, k) for k in COLS}
     if cols["azi_grid"] is not None:
@@ -214,7 +414,7 @@ def parse_raw(raw: pd.DataFrame, name: str, path: str, well: str) -> Trajectory:
     md = num("md")
     ok = md.notna()
     df = pd.DataFrame({"md": md, "inc": num("inc"), "azi": num("azi")})
-    for k in ("tvdss", "tvd", "north", "east"):
+    for k in ("tvdss", "tvd", "north", "east", "dx", "dy"):
         s = num(k)
         df[k] = s if s is not None else np.nan
     df["comment"] = data.iloc[:, cols["comment"]] if cols["comment"] is not None else ""
@@ -224,11 +424,20 @@ def parse_raw(raw: pd.DataFrame, name: str, path: str, well: str) -> Trajectory:
         raise ValueError("слишком мало точек траектории")
 
     md_, inc_, azi_ = df.md.values, df.inc.fillna(0).values, df.azi.ffill().fillna(0).values
-    # Координаты: если в файле есть — берём их, иначе пересчёт минимальной кривизной
+    # Координаты: если в файле есть — берём их; если есть только смещения dX/dY — берём их;
+    # иначе пересчёт минимальной кривизной
+    qc_dxy = np.nan
+    rel_xy = rel_z = False
     if df.north.notna().all() and df.east.notna().all():
         n_, e_ = df.north.values, df.east.values
+        if df.dx.notna().all() and df.dy.notna().all():
+            qc_dxy = float(max(np.abs(n_ - n_[0] - df.dx.values).max(), np.abs(e_ - e_[0] - df.dy.values).max()))
+    elif df.dx.notna().all() and df.dy.notna().all():
+        n_, e_ = df.dx.values.astype(float), df.dy.values.astype(float)
+        rel_xy = True
     else:
         n_, e_, _, _ = min_curvature(md_, inc_, azi_)
+        rel_xy = not (df.north.notna().any() and df.east.notna().any())
         n_ = n_ + (df.north.dropna().iloc[0] if df.north.notna().any() else 0)
         e_ = e_ + (df.east.dropna().iloc[0] if df.east.notna().any() else 0)
     if df.tvdss.notna().all():
@@ -237,9 +446,11 @@ def parse_raw(raw: pd.DataFrame, name: str, path: str, well: str) -> Trajectory:
     elif df.tvd.notna().all():
         tvd_ = df.tvd.values
         z_ = tvd_.copy()
+        rel_z = True
     else:
         _, _, tvd_, _ = min_curvature(md_, inc_, azi_)
         z_ = tvd_.copy()
+        rel_z = True
 
     marks = []
     for m, c in zip(md_, df.comment.tolist()):
@@ -247,9 +458,20 @@ def parse_raw(raw: pd.DataFrame, name: str, path: str, well: str) -> Trajectory:
         if c and c.lower() != "nan":
             marks.append((float(m), c))
 
-    return Trajectory(name, str(path), str(well), md_, inc_, azi_,
-                      n_, e_, z_, tvd_, marks, azi_src,
-                      {k: (raw.iloc[hr, v] if v is not None else None) for k, v in cols.items()})
+    t = Trajectory(name, str(path), str(well), md_, inc_, azi_,
+                   n_, e_, z_, tvd_, marks, azi_src,
+                   {k: (raw.iloc[hr, v] if v is not None else None) for k, v in cols.items()})
+    t.fmt = FORMAT_NAMES[fmt]
+    t.qc_dxy = qc_dxy
+    t.rel_xy, t.rel_z = rel_xy, rel_z
+    return t
+
+
+def _to_wellhead_frame(t: Trajectory, xy: bool, z: bool) -> Trajectory:
+    """Копия траектории с координатами относительно устья (для сравнения файлов с разной системой отсчёта)."""
+    from dataclasses import replace
+    return replace(t, n=t.n - t.n[0] if xy else t.n, e=t.e - t.e[0] if xy else t.e,
+                   z=t.z - t.z[0] if z else t.z, marks=list(t.marks))
 
 
 # ----------------------------------------------------------------------------
@@ -380,7 +602,9 @@ def traj_params(t: Trajectory, cfg) -> dict:
         "QC: отклонение пересчёта MC от координат файла, м": dev0,
         "QC: поправка азимута, совмещающая с координатами, град": best[1],
         "QC: остаток после поправки, м": best[0],
+        "QC: расхождение dX/dY файла с координатами, м": t.qc_dxy,
         "Тип азимута": t.azi_source,
+        "Формат файла": t.fmt,
     }
 
 
@@ -397,6 +621,14 @@ class PairResult:
 
 def compare(ref: Trajectory, alt: Trajectory, cfg=DEFAULTS, well: str | None = None) -> PairResult:
     well = well or ref.well
+    note = []
+    xy = ref.rel_xy != alt.rel_xy
+    zz = ref.rel_z != alt.rel_z
+    if xy or zz:
+        ref, alt = _to_wellhead_frame(ref, xy, zz), _to_wellhead_frame(alt, xy, zz)
+        who = [x.name for x in (ref, alt) if (xy and x.rel_xy) or (zz and x.rel_z)]
+        what = " и ".join(w for w, f in (("X/Y", xy), ("TVDSS", zz)) if f)
+        note.append(f"в файле {', '.join(who)} нет {what} — траектории сравниваются от общего устья")
     step = cfg["step_md"]
     gr, Pr = resample(ref, step)
     ga, Pa = resample(alt, step)
@@ -500,6 +732,8 @@ def compare(ref: Trajectory, alt: Trajectory, cfg=DEFAULTS, well: str | None = N
         "QC поправка азимута РН-ПД, °": pr["QC: поправка азимута, совмещающая с координатами, град"],
         "QC поправка азимута РНТ, °": pa["QC: поправка азимута, совмещающая с координатами, град"],
     }
+    if note:
+        row["Примечание"] = "; ".join(note)
     return PairResult(well, ref, alt, summary, targets, profile, row)
 
 
@@ -743,6 +977,13 @@ def _worker(job):
                        "Ошибка": f"{type(ex).__name__}: {ex}", "trace": traceback.format_exc(limit=3)}
 
 
+TRAJ_EXT = (".xlsx", ".xlsm", ".xls", ".csv", ".txt")
+
+
+def _traj_files(d) -> list[Path]:
+    return [p for p in Path(d).rglob("*") if p.suffix.lower() in TRAJ_EXT and not p.name.startswith("~$")]
+
+
 def _well_id(p: Path) -> str:
     try:
         s = pd.ExcelFile(p).sheet_names[0]
@@ -764,8 +1005,8 @@ def build_jobs(args, cfg):
                 rf, af = base / r["ref"], base / r["alt"]
                 jobs.append((r.get("well") or _well_id(rf), rf, af, args.out, cfg))
     elif args.ref_dir and args.alt_dir:
-        refs = {_well_id(p): p for p in Path(args.ref_dir).rglob("*.xls*") if not p.name.startswith("~$")}
-        alts = {_well_id(p): p for p in Path(args.alt_dir).rglob("*.xls*") if not p.name.startswith("~$")}
+        refs = {_well_id(p): p for p in _traj_files(args.ref_dir)}
+        alts = {_well_id(p): p for p in _traj_files(args.alt_dir)}
         for w in sorted(set(refs) | set(alts)):
             if w in refs and w in alts:
                 jobs.append((w, refs[w], alts[w], args.out, cfg))
@@ -773,9 +1014,8 @@ def build_jobs(args, cfg):
                 log.warning("Нет пары для скважины %s", w)
     elif args.root:
         groups: dict[Path, list[Path]] = {}
-        for p in Path(args.root).rglob("*.xls*"):
-            if not p.name.startswith("~$"):
-                groups.setdefault(p.parent, []).append(p)
+        for p in _traj_files(args.root):
+            groups.setdefault(p.parent, []).append(p)
         for d, files in sorted(groups.items()):
             refs = [p for p in files if rp.search(p.name)]
             alts = [p for p in files if ap.search(p.name)]
@@ -867,7 +1107,47 @@ def main(argv=None):
     p3.add_argument("--alt", required=True, help="папка с CSV (файл на скважину) или один CSV с колонкой «Скважина»")
     p3.add_argument("--csv-sep", default=",", help="разделитель CSV (по умолчанию запятая; auto — определить)")
     p3.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
+    p4 = sub.add_parser("formats", help="поддерживаемые форматы файлов траекторий")
+    p5 = sub.add_parser("example", help="сохранить пример файла указанного формата")
+    p5.add_argument("code", nargs="?", help="код формата (см. команду formats); без кода — все примеры")
+    p5.add_argument("-o", "--out", default=".", help="папка, куда сохранить")
+    p6 = sub.add_parser("detect", help="показать, как программа распознала файл")
+    p6.add_argument("files", nargs="+")
     a = ap.parse_args(argv)
+    if a.cmd == "formats":
+        for f in FORMATS:
+            print(f"[{f['code']}] {f['name']}\n  Файл: {f['file']}\n  {f['note']}")
+            for c, d, req in f["columns"]:
+                print(f"    {c:<32} {d}{'  (обязательно)' if req else ''}")
+            if f["example"]:
+                print(f"  Пример: TrajCompare example {f['code']}")
+            print()
+        return
+    if a.cmd == "example":
+        import shutil
+        out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
+        for f in FORMATS:
+            if f["example"] and (a.code in (None, f["code"])):
+                src = examples_dir() / f["example"]
+                if src.exists():
+                    shutil.copy(src, out / f["example"])
+                    print(out / f["example"])
+        return
+    if a.cmd == "detect":
+        for p in a.files:
+            try:
+                info = describe_file(p)
+            except Exception as ex:  # noqa: BLE001
+                print(f"{p}: не удалось прочитать — {ex}\n")
+                continue
+            for k, v in info.items():
+                if k != "Таблицы":
+                    print(f"{k:<20} {v}")
+            for tb in info["Таблицы"]:
+                for k, v in tb.items():
+                    print(f"  {k:<18} {v}")
+            print()
+        return
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     cfg = dict(DEFAULTS)

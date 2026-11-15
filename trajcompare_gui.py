@@ -53,7 +53,7 @@ class QueueHandler(logging.Handler):
         self.q.put(("log", self.format(record)))
 
 
-def run_gui():
+def run_gui(selftest=False):
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox
     import trajcompare as tc
@@ -114,13 +114,35 @@ def run_gui():
         d["ddi_method"] = METHOD_BY_NAME.get(ddi_method_var.get(), "oag")
         d.update({"_" + k: v.get() for k, v in paths.items()})
         d.update(_mode=mode.get(), _ref_pattern=ref_pat.get(), _alt_pattern=alt_pat.get(),
-                 _workers=int(workers.get()), _skip=bool(skip_var.get()), _csv_sep=csv_sep.get())
+                 _workers=int(workers.get()), _skip=bool(skip_var.get()), _csv_sep=SEP_NAMES.get(csv_sep.get(), "auto"))
         try:
             SETTINGS_FILE.write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
         except Exception:  # noqa: BLE001
             pass
 
     # ---------- общие элементы ----------
+    TRAJ_FT = [("Траектории (Excel, CSV, TXT)", "*.xlsx *.xlsm *.xls *.csv *.txt"), ("Excel", "*.xlsx *.xlsm *.xls"),
+               ("CSV / TXT", "*.csv *.txt"), ("Все файлы", "*.*")]
+
+    def path_row2(parent, r, label, var):
+        """Строка выбора: файл или папка."""
+        ttk.Label(parent, text=label).grid(row=r, column=0, sticky="w", padx=6, pady=4)
+        ttk.Entry(parent, textvariable=var).grid(row=r, column=1, sticky="ew", padx=6, pady=4)
+        fr = ttk.Frame(parent)
+        fr.grid(row=r, column=2, padx=6)
+
+        def pick_dir():
+            p = filedialog.askdirectory()
+            if p:
+                var.set(p)
+
+        def pick_file():
+            p = filedialog.askopenfilename(filetypes=TRAJ_FT)
+            if p:
+                var.set(p)
+        ttk.Button(fr, text="Папка…", command=pick_dir).pack(side="left")
+        ttk.Button(fr, text="Файл…", command=pick_file).pack(side="left", padx=(4, 0))
+
     def path_row(parent, r, label, var, kind, ftypes=None):
         ttk.Label(parent, text=label).grid(row=r, column=0, sticky="w", padx=6, pady=4)
         ttk.Entry(parent, textvariable=var).grid(row=r, column=1, sticky="ew", padx=6, pady=4)
@@ -132,7 +154,7 @@ def run_gui():
             elif kind == "csvdir":
                 p = filedialog.askopenfilename(filetypes=[("CSV", "*.csv"), ("Все", "*.*")])
             elif kind == "file":
-                p = filedialog.askopenfilename(filetypes=ftypes or [("Excel", "*.xlsx *.xlsm *.xls"), ("Все", "*.*")])
+                p = filedialog.askopenfilename(filetypes=ftypes or TRAJ_FT)
             else:
                 p = filedialog.askdirectory()
             if p:
@@ -144,27 +166,15 @@ def run_gui():
 
     # ================= Вкладка «Книга + CSV» =================
     t0 = ttk.Frame(nb, padding=8)
-    nb.add(t0, text="  Книга РН-ПД + CSV  ")
+    nb.add(t0, text="  Сравнение по скважинам  ")
     t0.columnconfigure(1, weight=1)
-    path_row(t0, 0, "Книга РН-ПД (лист = скважина):", paths["wb_ref"], "file")
-    ttk.Label(t0, text="РНТ (CSV):").grid(row=1, column=0, sticky="w", padx=6, pady=4)
-    ttk.Entry(t0, textvariable=paths["wb_alt"]).grid(row=1, column=1, sticky="ew", padx=6, pady=4)
-    altb = ttk.Frame(t0)
-    altb.grid(row=1, column=2, padx=6)
-
-    def pick_alt_dir():
-        p = filedialog.askdirectory()
-        if p:
-            paths["wb_alt"].set(p)
-
-    def pick_alt_file():
-        p = filedialog.askopenfilename(filetypes=[("CSV", "*.csv"), ("Все", "*.*")])
-        if p:
-            paths["wb_alt"].set(p)
-    ttk.Button(altb, text="Папка…", command=pick_alt_dir).pack(side="left")
-    ttk.Button(altb, text="Файл…", command=pick_alt_file).pack(side="left", padx=(4, 0))
-    ttk.Label(t0, foreground="#666", text="Папка с CSV (файл на скважину, номер скважины в имени файла) "
-              "или один CSV с колонкой «Скважина». Разделитель — запятая.").grid(row=2, column=1, sticky="w", padx=6)
+    path_row2(t0, 0, "РН-ПД (книга, файл или папка):", paths["wb_ref"])
+    path_row2(t0, 1, "РНТ (папка или файл):", paths["wb_alt"])
+    hint0 = ttk.Frame(t0)
+    hint0.grid(row=2, column=1, columnspan=2, sticky="w", padx=6)
+    ttk.Label(hint0, foreground="#666", text="Формат определяется автоматически: «Структура файла траекторий» (CSV), "
+              "«Профиль скважины» (Excel), книга «лист = скважина», CSV с колонкой «Скважина».").pack(side="left")
+    ttk.Button(hint0, text="? Форматы и примеры", command=lambda: open_formats_help()).pack(side="left", padx=8)
     path_row(t0, 3, "Итоговый файл:", paths["wb_out"], "save")
     ttk.Label(t0, foreground="#666", text="Один Excel-файл: лист «Сводная», затем лист на каждую скважину, "
               "в конце «Ошибки».").grid(row=4, column=1, sticky="w", padx=6)
@@ -173,8 +183,10 @@ def run_gui():
     ttk.Label(o0, text="Процессов:").pack(side="left")
     ttk.Spinbox(o0, from_=1, to=64, textvariable=workers, width=4).pack(side="left", padx=4)
     ttk.Label(o0, text="   Разделитель CSV:").pack(side="left")
-    csv_sep = tk.StringVar(value=saved.get("_csv_sep", ","))
-    ttk.Combobox(o0, textvariable=csv_sep, values=[",", ";", "auto"], width=6, state="readonly").pack(side="left", padx=4)
+    SEP_NAMES = {"авто": "auto", "запятая": ",", "точка с запятой": ";", "табуляция": "\t"}
+    _sv = saved.get("_csv_sep", "auto")
+    csv_sep = tk.StringVar(value={v: k for k, v in SEP_NAMES.items()}.get("auto" if _sv == "," else _sv, "авто"))
+    ttk.Combobox(o0, textvariable=csv_sep, values=list(SEP_NAMES), width=16, state="readonly").pack(side="left", padx=4)
     b0 = ttk.Frame(t0)
     b0.grid(row=6, column=0, columnspan=3, sticky="w", padx=6, pady=6)
     run0 = ttk.Button(b0, text="▶  Сравнить все скважины")
@@ -198,6 +210,8 @@ def run_gui():
     path_row(t1, 0, "РН-ПД:", paths["ref"], "file")
     path_row(t1, 1, "РНТ:", paths["alt"], "file")
     path_row(t1, 2, "Папка результатов:", paths["out_pair"], "dir")
+    ttk.Button(t1, text="? Форматы и примеры", command=lambda: open_formats_help()).grid(
+        row=0, column=3, rowspan=2, padx=(0, 6))
     ttk.Label(t1, text="Если папка не указана — результаты кладутся рядом с файлом РН-ПД, в папку «Сравнение».",
               foreground="#666").grid(row=3, column=1, sticky="w", padx=6)
 
@@ -314,6 +328,182 @@ def run_gui():
     status = ttk.Label(root, text="Готово к работе", anchor="w", padding=(10, 4))
     status.pack(fill="x")
 
+    # ================= Справка: форматы, примеры, проверка файла =================
+    import shutil
+    import tempfile
+
+    def example_file(fmt):
+        p = tc.examples_dir() / fmt["example"] if fmt.get("example") else None
+        return p if p and p.exists() else None
+
+    def export_example(fmt):
+        """Копия примера в папку пользователя (файлы внутри exe открывать напрямую нельзя)."""
+        src = example_file(fmt)
+        if not src:
+            messagebox.showwarning(APP_TITLE, "Пример для этого формата не найден в составе программы.")
+            return None
+        dst_dir = Path(tempfile.gettempdir()) / "TrajCompare_примеры"
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        dst = dst_dir / src.name
+        try:
+            shutil.copy(src, dst)
+        except PermissionError:
+            pass            # файл уже открыт — покажем существующую копию
+        return dst
+
+    def preview_file(path, title=None):
+        """Окно предпросмотра: как программа распознала файл + первые строки таблицы."""
+        path = Path(path)
+        try:
+            info = tc.describe_file(path)
+            tables = tc.read_tables(path)
+        except Exception as ex:  # noqa: BLE001
+            messagebox.showerror(APP_TITLE, f"Не удалось прочитать файл:\n{path}\n\n{ex}")
+            return
+        win = tk.Toplevel(root)
+        win.title(title or f"Просмотр — {path.name}")
+        win.geometry("1100x620")
+        top = ttk.Frame(win, padding=8)
+        top.pack(fill="x")
+        lines = [f"Файл: {path}", f"Тип по содержимому: {info['Тип по содержимому']}"]
+        if "Кодировка" in info:
+            lines.append(f"Кодировка: {info['Кодировка']};  разделитель: {info['Разделитель']}")
+        for tb in info["Таблицы"]:
+            sh = f"Лист «{tb['Лист']}»: " if tb.get("Лист") else ""
+            if "Причина" in tb:
+                lines.append(f"{sh}формат не распознан — {tb['Причина']}")
+            else:
+                lines.append(f"{sh}формат «{tb['Формат']}», строка заголовков {tb['Строка заголовков']}, точек {tb['Точек']}")
+        ttk.Label(top, text="\n".join(lines[:12]), justify="left").pack(side="left", anchor="w")
+        bar = ttk.Frame(win, padding=(8, 0))
+        bar.pack(fill="x")
+        sheet_var = tk.StringVar(value=str(tables[0][0]) if tables[0][0] is not None else "")
+        if len(tables) > 1:
+            ttk.Label(bar, text="Лист:").pack(side="left")
+            ttk.Combobox(bar, textvariable=sheet_var, values=[str(t[0]) for t in tables], state="readonly",
+                         width=20).pack(side="left", padx=4)
+        ttk.Button(bar, text="Открыть в программе по умолчанию", command=lambda: open_path(path)).pack(side="right")
+        ttk.Label(bar, foreground="#666", text="Показаны первые 300 строк. Подсвечены распознанные столбцы.").pack(
+            side="left", padx=10)
+        frm = ttk.Frame(win, padding=8)
+        frm.pack(fill="both", expand=True)
+        tree = ttk.Treeview(frm, show="headings")
+        vs = ttk.Scrollbar(frm, orient="vertical", command=tree.yview)
+        hs = ttk.Scrollbar(frm, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=vs.set, xscrollcommand=hs.set)
+        tree.grid(row=0, column=0, sticky="nsew"); vs.grid(row=0, column=1, sticky="ns"); hs.grid(row=1, column=0, sticky="ew")
+        frm.rowconfigure(0, weight=1); frm.columnconfigure(0, weight=1)
+
+        def show(*_):
+            raw = dict((str(k), v) for k, v in tables).get(sheet_var.get(), tables[0][1])
+            try:
+                hr = tc._find_header_row(raw)
+            except ValueError:
+                hr = 0
+            hdr = [str(c).replace("\n", " ").strip() if str(c) != "nan" else f"[{j + 1}]"
+                   for j, c in enumerate(raw.iloc[hr].tolist())]
+            known = set()
+            try:
+                hn = [tc._norm(c) for c in raw.iloc[hr].tolist()]
+                d = raw.iloc[hr + 1:]
+                known = {tc._pick(hn, d, k) for k in tc.COLS} - {None}
+            except Exception:  # noqa: BLE001
+                pass
+            cols = [f"c{j}" for j in range(len(hdr))]
+            tree.delete(*tree.get_children())
+            tree["columns"] = cols
+            for j, (c, h) in enumerate(zip(cols, hdr)):
+                tree.heading(c, text=("✔ " if j in known else "") + h)
+                tree.column(c, width=max(70, min(220, 9 * len(h))), stretch=False)
+            for _, r in raw.iloc[hr + 1:hr + 301].iterrows():
+                tree.insert("", "end", values=["" if str(v) in ("nan", "None") else v for v in r.tolist()])
+        sheet_var.trace_add("write", show)
+        show()
+
+    def check_file():
+        p = filedialog.askopenfilename(title="Какой формат у файла?", filetypes=TRAJ_FT)
+        if p:
+            preview_file(p, f"Проверка формата — {Path(p).name}")
+
+    def open_formats_help(select=None):
+        win = tk.Toplevel(root)
+        win.title("Справка — форматы файлов траекторий")
+        win.geometry("1000x600")
+        pan = ttk.Frame(win, padding=8)
+        pan.pack(fill="both", expand=True)
+        lb = tk.Listbox(pan, width=34, exportselection=False, font=("Segoe UI", 10))
+        lb.grid(row=0, column=0, rowspan=3, sticky="ns", padx=(0, 10))
+        for f in tc.FORMATS:
+            lb.insert("end", f["name"])
+        head = ttk.Label(pan, font=("Segoe UI", 12, "bold"))
+        head.grid(row=0, column=1, sticky="w")
+        txt = tk.Text(pan, height=6, wrap="word", relief="flat", bg="#f7f7f7", font=("Segoe UI", 10))
+        txt.grid(row=1, column=1, sticky="ew", pady=4)
+        tv = ttk.Treeview(pan, columns=("c", "d", "r"), show="headings", height=10)
+        for c, h, w in (("c", "Столбец (заголовок в файле)", 260), ("d", "Что содержит", 420), ("r", "Обязательный", 110)):
+            tv.heading(c, text=h); tv.column(c, width=w, stretch=(c == "d"))
+        tv.grid(row=2, column=1, sticky="nsew")
+        pan.columnconfigure(1, weight=1); pan.rowconfigure(2, weight=1)
+        btn = ttk.Frame(win, padding=8)
+        btn.pack(fill="x")
+        b_show = ttk.Button(btn, text="Показать пример здесь")
+        b_open = ttk.Button(btn, text="Открыть пример в Excel / программе по умолчанию")
+        b_save = ttk.Button(btn, text="Сохранить пример как…")
+        for b in (b_show, b_open, b_save):
+            b.pack(side="left", padx=(0, 8))
+        ttk.Button(btn, text="Проверить свой файл…", command=check_file).pack(side="right")
+        ttk.Label(win, foreground="#666", padding=(8, 0, 8, 8), justify="left", text=(
+            "Тип файла (Excel или текст), кодировка, разделитель и формат таблицы определяются автоматически — "
+            "расширение файла не важно.\nCSV с запятой в Excel с русскими настройками может открыться в один столбец: "
+            "используйте «Показать пример здесь» или в Excel «Данные → Из текста/CSV».")).pack(fill="x")
+
+        def sel(*_):
+            i = lb.curselection()
+            f = tc.FORMATS[i[0] if i else 0]
+            head.config(text=f["name"])
+            txt.config(state="normal"); txt.delete("1.0", "end")
+            txt.insert("end", f"Файл: {f['file']}\n\n{f['note']}")
+            txt.config(state="disabled")
+            tv.delete(*tv.get_children())
+            for c, d, req in f["columns"]:
+                tv.insert("", "end", values=(c, d, "да" if req else ""))
+            ex = example_file(f)
+            st = "normal" if ex else "disabled"
+            b_show.config(state=st, command=lambda: preview_file(ex, f"Пример — {f['name']}"))
+            b_open.config(state=st, command=lambda: (lambda p: p and open_path(p))(export_example(f)))
+
+            def save_as():
+                p = filedialog.asksaveasfilename(initialfile=ex.name, defaultextension=ex.suffix,
+                                                 filetypes=[("Пример", "*" + ex.suffix)])
+                if p:
+                    shutil.copy(ex, p)
+                    status.config(text=f"Пример сохранён: {p}")
+            b_save.config(state=st, command=save_as)
+        lb.bind("<<ListboxSelect>>", sel)
+        idx = next((i for i, f in enumerate(tc.FORMATS) if f["code"] == select), 0)
+        lb.selection_set(idx)
+        sel()
+        return win
+
+    menubar = tk.Menu(root)
+    m_help = tk.Menu(menubar, tearoff=0)
+    m_help.add_command(label="Форматы файлов и примеры…", command=lambda: open_formats_help())
+    m_help.add_command(label="Пример: «Структура файла траекторий» (CSV)",
+                       command=lambda: preview_file(example_file(tc.FORMATS[0]), "Пример — Структура файла траекторий")
+                       if example_file(tc.FORMATS[0]) else None)
+    m_help.add_command(label="Проверить формат файла…", command=check_file)
+    m_help.add_separator()
+    m_help.add_command(label="Открыть папку с примерами",
+                       command=lambda: [export_example(f) for f in tc.FORMATS if f.get("example")] and
+                       open_path(Path(tempfile.gettempdir()) / "TrajCompare_примеры"))
+    m_help.add_command(label="О программе", command=lambda: messagebox.showinfo(
+        APP_TITLE, "TrajCompare — сравнение траекторий скважин РН-ПД и РНТ.\n"
+                   "Поддерживаемые форматы: «Структура файла траекторий» (CSV), «Профиль скважины» (Excel), "
+                   "книга «лист = скважина», CSV с колонкой «Скважина», произвольные таблицы."))
+    menubar.add_cascade(label="Справка", menu=m_help)
+    root.config(menu=menubar)
+    root.bind("<F1>", lambda e: open_formats_help())
+
     VCOL = {"Сходятся": "#2e7d32", "Условно сходятся": "#b26a00", "Не сходятся": "#c62828"}
 
     # ---------- действия ----------
@@ -388,19 +578,20 @@ def run_gui():
     def do_workbook():
         ref, alt = paths["wb_ref"].get().strip(), paths["wb_alt"].get().strip()
         if not (ref and alt):
-            messagebox.showwarning(APP_TITLE, "Выберите книгу РН-ПД и CSV РНТ (папку или файл).")
+            messagebox.showwarning(APP_TITLE, "Выберите траектории РН-ПД и РНТ (файл или папку).")
             return
         try:
             c = cfg()
         except ValueError as ex:
             messagebox.showerror(APP_TITLE, str(ex))
             return
-        out = paths["wb_out"].get().strip() or str(Path(ref).with_name("Сравнение_траекторий.xlsx"))
+        out = paths["wb_out"].get().strip() or str((Path(ref) if Path(ref).is_dir() else Path(ref).parent)
+                                                   / "Сравнение_траекторий.xlsx")
         if not out.lower().endswith(".xlsx"):
             out += ".xlsx"
         paths["wb_out"].set(out)
         save_settings()
-        tc.CSV_SEP = csv_sep.get()
+        tc.CSV_SEP = SEP_NAMES.get(csv_sep.get(), "auto")
         cancel0.clear()
         run0.config(state="disabled"); stop0.config(state="normal"); open0.config(state="disabled")
         log0.delete("1.0", "end"); pb0.config(value=0, maximum=1)
@@ -513,12 +704,36 @@ def run_gui():
 
     root.protocol("WM_DELETE_WINDOW", on_close)
     root.after(150, poll)
+    if selftest:
+        errors = []
+        root.report_callback_exception = lambda *a: errors.append("".join(traceback.format_exception(*a)))
+
+        def step1():
+            w = open_formats_help("traj_struct")
+            for f in tc.FORMATS:
+                if example_file(f):
+                    preview_file(example_file(f))
+            nb.select(1); nb.select(2); nb.select(3); nb.select(0)
+            root.after(1500, finish)
+
+        def finish():
+            (APP_DIR / "selftest_gui.log").write_text("OK" if not errors else "\n".join(errors), encoding="utf-8")
+            root.destroy()
+            if errors:
+                sys.exit(1)
+        root.after(500, step1)
     root.mainloop()
 
 
 def main():
     multiprocessing.freeze_support()
-    if len(sys.argv) > 1:
+    if sys.argv[1:] == ["--selftest-gui"]:
+        try:
+            run_gui(selftest=True)
+        except Exception:  # noqa: BLE001
+            (APP_DIR / "selftest_gui.log").write_text(traceback.format_exc(), encoding="utf-8")
+            sys.exit(1)
+    elif len(sys.argv) > 1:
         import trajcompare
         trajcompare.main()
     else:

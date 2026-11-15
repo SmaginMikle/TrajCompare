@@ -41,45 +41,81 @@ def _tokens(s) -> set[str]:
 # ----------------------------------------------------------------------------
 # Загрузка исходных данных
 # ----------------------------------------------------------------------------
-def load_reference_book(path) -> dict[str, pd.DataFrame]:
-    log.info("Читаю книгу РН-ПД %s …", Path(path).name)
-    t0 = time.time()
-    book = pd.read_excel(path, sheet_name=None, header=None)
-    book = {str(k).strip(): v for k, v in book.items() if v.dropna(how="all").shape[0] > 3}
-    log.info("  листов со скважинами: %d (%.0f с)", len(book), time.time() - t0)
-    return book
+SUPPORTED_EXT = (".csv", ".txt", ".xlsx", ".xlsm", ".xls")
+_DEFAULT_SHEETS = ("sheet1", "лист1", "sheet", "лист", "data", "данные")
 
 
-def load_alternatives(path) -> dict[str, tuple[str, pd.DataFrame]]:
-    """Возвращает {имя скважины: (источник, сырая таблица)}."""
+def load_source(path, label: str) -> dict[str, tuple[str, object]]:
+    """Загрузка траекторий из файла или папки в любом поддерживаемом формате.
+
+    Возвращает {скважина: (источник, сырая таблица | Exception)}.
+      • папка — все файлы CSV/TXT/XLSX внутри (включая подпапки);
+      • книга Excel с несколькими листами — лист = скважина;
+      • файл с колонкой «Скважина» — делится по скважинам;
+      • иначе номер скважины — имя листа (если в нём есть цифры) или имя файла.
+    Тип файла и формат таблицы определяются по содержимому.
+    """
     path = Path(path)
-    out: dict[str, tuple[str, pd.DataFrame]] = {}
-    files = sorted(p for p in path.rglob("*.csv")) if path.is_dir() else [path]
+    t0 = time.time()
+    files = sorted(p for p in path.rglob("*") if p.suffix.lower() in SUPPORTED_EXT and not p.name.startswith("~$")) \
+        if path.is_dir() else [path]
+    out: dict[str, tuple[str, object]] = {}
+
+    def add(w, src, raw):
+        w = str(w).strip()
+        if w in out and not isinstance(out[w][1], Exception):
+            log.warning("%s: скважина %s встречается повторно (%s) — взята первая", label, w, src)
+            return
+        out[w] = (src, raw)
+
     for f in files:
         try:
-            raw = tc.read_csv_raw(f)
+            tables = tc.read_tables(f)
         except Exception as ex:  # noqa: BLE001
             log.warning("Не читается %s: %s", f.name, ex)
-            out[f.stem] = (str(f), ex)          # ошибку покажем на листе «Ошибки»
+            add(f.stem, f.name, ex)
             continue
-        # Один CSV на много скважин — ищем колонку «Скважина»
-        try:
-            hr = tc._find_header_row(raw)
-        except ValueError as ex:
-            out[f.stem] = (str(f), ex)
-            continue
-        headers = [tc._norm(c) for c in raw.iloc[hr].tolist()]
-        data = raw.iloc[hr + 1:]
-        wc = tc._pick(headers, data, "well")
-        if wc is not None and data.iloc[:, wc].nunique(dropna=True) > 1:
-            for w, part in data.groupby(data.iloc[:, wc].astype(str).str.strip(), sort=False):
-                if w and w.lower() != "nan":
-                    out[w] = (f"{f.name} [{w}]", pd.concat([raw.iloc[[hr]], part]))
-        else:
-            w = str(data.iloc[:, wc].dropna().iloc[0]).strip() if wc is not None and data.iloc[:, wc].notna().any() else f.stem
-            out[w if wc is not None else f.stem] = (f.name, raw)
-    log.info("РНТ найдено: %d", len(out))
+        multi = len(tables) > 1
+        for sheet, raw in tables:
+            if raw.dropna(how="all").shape[0] <= 3:
+                continue
+            where = f"{f.name} / лист «{sheet}»" if sheet is not None and multi else f.name
+            try:
+                hr = tc._find_header_row(raw)
+            except ValueError as ex:
+                if multi:
+                    log.info("%s: лист «%s» пропущен — это не траектория", f.name, sheet)
+                else:
+                    add(f.stem, where, ex)
+                continue
+            headers = [tc._norm(c) for c in raw.iloc[hr].tolist()]
+            data = raw.iloc[hr + 1:]
+            wc = tc._pick(headers, data, "well")
+            names = data.iloc[:, wc].dropna().astype(str).str.strip() if wc is not None else pd.Series(dtype=str)
+            names = names[(names != "") & (names.str.lower() != "nan")]
+            if wc is not None and names.nunique() > 1:
+                key = data.iloc[:, wc].astype(str).str.strip()
+                for w, part in data.groupby(key, sort=False):
+                    if w and w.lower() != "nan":
+                        add(w, f"{where} [{w}]", pd.concat([raw.iloc[[hr]], part]))
+                continue
+            if wc is not None and len(names):
+                w = names.iloc[0]
+            elif sheet is not None and (multi or (re.search(r"\d", sheet) and sheet.lower() not in _DEFAULT_SHEETS)):
+                w = sheet
+            else:
+                w = f.stem
+            add(w, where, raw)
+    log.info("%s: найдено скважин %d (%.0f с)", label, len(out), time.time() - t0)
     return out
+
+
+def load_reference_book(path):           # совместимость со старым кодом
+    return {w: raw for w, (src, raw) in load_source(path, "РН-ПД").items() if not isinstance(raw, Exception)}
+
+
+def load_alternatives(path):             # совместимость со старым кодом
+    return load_source(path, "РНТ")
 
 
 def match_wells(ref_names, alt_names):
@@ -133,6 +169,7 @@ def _job(args):
             png = buf.getvalue()
         light = dict(row=res.row, summary=res.summary, targets=res.targets,
                      profile=res.profile, png=png, ref_src=ref_src, alt_src=alt_src,
+                     ref_fmt=ref.fmt, alt_fmt=alt.fmt,
                      traj={"РН-ПД": _traj_arrays(ref), "РНТ": _traj_arrays(alt)})
         return True, well, light
     except Exception as ex:  # noqa: BLE001
@@ -323,10 +360,16 @@ def write_result_book(results: list[dict], errors: list[dict], out_path, cfg, so
         df = df[[c for c in first if c in df.columns] + [c for c in df.columns if c not in first + ["РН-ПД", "РНТ"]]]
     ncol = len(df.columns)
     n = len(df)
+    fc = {}
+    for r_ in results:
+        for k_ in ("ref_fmt", "alt_fmt"):
+            if r_.get(k_):
+                fc[r_[k_]] = fc.get(r_[k_], 0) + 1
+    fmt_summary = "; ".join(f"{k_} — {v_}" for k_, v_ in fc.items()) or "—"
     vc = df["Вердикт"].value_counts() if n else pd.Series(dtype=int)
 
     ws.write_string(0, 0, "Сравнение траекторий скважин: РН-ПД vs РНТ", f_title)
-    T0 = 18                      # строка заголовка таблицы (0-based)
+    T0 = 19                      # строка заголовка таблицы (0-based)
     first_data, last_data = T0 + 1, T0 + n
     col = {c: j for j, c in enumerate(df.columns)}
 
@@ -335,8 +378,9 @@ def write_result_book(results: list[dict], errors: list[dict], out_path, cfg, so
         return f"{_cell(first_data, j, True, True)}:{_cell(max(last_data, first_data), j, True, True)}"
 
     stats = [
-        ("РН-ПД (книга)", Path(sources.get("ref", "")).name, None),
-        ("РНТ (CSV)", Path(sources.get("alt", "")).name, None),
+        ("Источник РН-ПД", Path(sources.get("ref", "")).name, None),
+        ("Источник РНТ", Path(sources.get("alt", "")).name, None),
+        ("Форматы файлов", fmt_summary, None),
         ("Сравнено скважин", n, None),
         ("Сходятся", int(vc.get("Сходятся", 0)), None),
         ("Условно сходятся", int(vc.get("Условно сходятся", 0)), None),
@@ -422,12 +466,12 @@ def write_result_book(results: list[dict], errors: list[dict], out_path, cfg, so
         sh.merge_range(0, 0, 0, 3, f"Скважина {w} — {v}", VTITLE.get(v, f_title))
         # строки пишем строго по порядку (режим constant_memory)
         sh.write_url(1, 0, "internal:'Сводная'!A1", f_link, "← к сводной")
-        sh.write_string(1, 1, f"Источник РН-ПД: {res['ref_src']}")
+        sh.write_string(1, 1, f"Источник РН-ПД: {res['ref_src']}  ·  формат: «{res.get('ref_fmt', '')}»")
         if with_traj:
             tsheet, a0, a1 = POS["РН-ПД"][w]
             sh.write_url(2, 0, f"internal:{_q(tsheet)}!A{a0 + 1}", f_link,
                          f"→ траектория РН-ПД (строки {a0 + 1}–{a1 + 1})", f"Лист «{tsheet}»")
-        sh.write_string(2, 1, f"Источник РНТ: {res['alt_src']}")
+        sh.write_string(2, 1, f"Источник РНТ: {res['alt_src']}  ·  формат: «{res.get('alt_fmt', '')}»")
         if with_traj:
             tsheet, a0, a1 = POS["РНТ"][w]
             sh.write_url(3, 0, f"internal:{_q(tsheet)}!A{a0 + 1}", f_link,
@@ -694,25 +738,34 @@ def write_result_book(results: list[dict], errors: list[dict], out_path, cfg, so
 def run_workbook(ref_xlsx, alt_csv, out_xlsx, cfg=None, workers=1, progress=None, cancel=None):
     cfg = dict(tc.DEFAULTS, **(cfg or {}))
     t0 = time.time()
-    book = load_reference_book(ref_xlsx)
-    alts = load_alternatives(alt_csv)
-    pairs, no_alt, no_ref = match_wells(list(book), list(alts))
+    refs = load_source(ref_xlsx, "РН-ПД")
+    alts = load_source(alt_csv, "РНТ")
+    pairs, no_alt, no_ref = match_wells(list(refs), list(alts))
     log.info("Пар: %d; РН-ПД без РНТ: %d; РНТ без РН-ПД: %d",
              len(pairs), len(no_alt), len(no_ref))
 
-    errors = [{"Скважина": w, "Проблема": "Нет CSV РНТ", "Подробности":
-               "лист есть в книге РН-ПД, подходящий CSV не найден", "РН-ПД": f"лист «{w}»"} for w in no_alt]
+    errors = []
+    for w in no_alt:
+        src, raw = refs[w]
+        errors.append({"Скважина": w, "Проблема": "Файл РН-ПД не читается" if isinstance(raw, Exception)
+                       else "Нет траектории РНТ",
+                       "Подробности": str(raw) if isinstance(raw, Exception) else "траектория РНТ с таким номером не найдена",
+                       "РН-ПД": src})
     jobs = []
     for r, a in pairs:
-        src, raw = alts[a]
-        if isinstance(raw, Exception):
-            errors.append({"Скважина": r, "Проблема": "CSV не читается", "Подробности": str(raw), "РНТ": src})
+        rsrc, rraw = refs[r]
+        asrc, araw = alts[a]
+        bad = [(k, s_, x) for k, s_, x in (("РН-ПД", rsrc, rraw), ("РНТ", asrc, araw)) if isinstance(x, Exception)]
+        if bad:
+            for k, s_, x in bad:
+                errors.append({"Скважина": r, "Проблема": f"Файл {k} не читается", "Подробности": str(x), k: s_})
             continue
-        jobs.append((r, book[r], f"{Path(ref_xlsx).name} / лист «{r}»", raw, src, cfg))
+        jobs.append((r, rraw, rsrc, araw, asrc, cfg))
     for a in no_ref:
         src, raw = alts[a]
-        errors.append({"Скважина": a, "Проблема": "Нет листа в книге РН-ПД" if not isinstance(raw, Exception)
-                       else "CSV не читается", "Подробности": "" if not isinstance(raw, Exception) else str(raw),
+        errors.append({"Скважина": a, "Проблема": "Файл РНТ не читается" if isinstance(raw, Exception)
+                       else "Нет траектории РН-ПД",
+                       "Подробности": str(raw) if isinstance(raw, Exception) else "траектория РН-ПД с таким номером не найдена",
                        "РНТ": src})
 
     results = []

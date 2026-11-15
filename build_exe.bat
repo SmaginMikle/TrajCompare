@@ -30,6 +30,7 @@ echo Собираю exe (2-5 минут)...
 pyinstaller --noconfirm --clean --onefile --windowed ^
   --name TrajCompare ^
   --hidden-import mpl_toolkits.mplot3d --hidden-import workbook_mode ^
+  --add-data "examples;examples" ^
   --exclude-module scipy --exclude-module IPython --exclude-module PyQt5 --exclude-module PySide6 ^
   trajcompare_gui.py || goto :err
 
